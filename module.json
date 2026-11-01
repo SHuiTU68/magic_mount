@@ -1,0 +1,19 @@
+{
+    "metamodule": true,
+    "summary": {
+        "en": "Meta module for magic mount support",
+        "zh": "magic mount挂载支持"
+    },
+    "description": {
+        "en": "This module is APatch build-in mount system, some module need",
+        "zh": ""
+    },
+    "sourceUrl": "https://github.com/AndroidPatch/magic_mount",
+    "downloadUrl": "https://github.com/AndroidPatch/magic_mount/releases/download/0.2/magic_mount.zip",
+    "modulename": "Magic Meta Module",
+    "authors": ["APatch Modules Team"],
+    "license": "GPL-2.0-only",
+    "moduleid": "magic_mount",
+    "version": "2",
+    "VersionCode": 2
+}

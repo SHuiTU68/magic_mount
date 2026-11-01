@@ -1,0 +1,68 @@
+name: Build Module
+
+on:
+  push:
+    tags: [ "*" ]
+    branches: [ "main" ]
+  workflow_call:
+  workflow_dispatch:
+jobs:
+  build-lkm:
+    uses: ./.github/workflows/build-lkm.yml
+    with:
+      build_all: true
+
+  build-module:
+    needs: build-lkm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      - name: Install toolchain
+        run: |
+          rustup default stable
+          rustup update stable
+          cargo install cargo-ndk
+          rustup target install aarch64-linux-android
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: my_lua_module
+          cache-targets: false
+      
+      - name: Build Rust
+        run: |
+          cd my_lua_module
+          cargo ndk -t aarch64-linux-android -- build --release
+
+      - name: Download lkm
+        uses: actions/download-artifact@v4
+        with:
+          name: lkm
+          path: lkm
+
+      - name: copy to output
+        run: |
+          mkdir -p build/lkm
+          cp my_lua_module/target/aarch64-linux-android/release/libmagic_mount.so build/
+          upx --best --lzma --android-shlib build/libmagic_mount.so
+          cp module/* build/
+          cp lkm/*.ko build/lkm/
+          ls -lh build build/lkm
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: magic_mount
+          path: build

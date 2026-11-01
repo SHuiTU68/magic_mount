@@ -1,0 +1,181 @@
+name: build lkm
+
+on:
+  workflow_call:
+    inputs:
+      build_all:
+        description: 'Force build all KMIs'
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      build_all:
+        description: 'Build every KMI'
+        default: true
+        type: boolean
+      kmi_android12_5_10:
+        description: android12-5.10
+        default: false
+        type: boolean
+      kmi_android13_5_10:
+        description: android13-5.10
+        default: false
+        type: boolean
+      kmi_android13_5_15:
+        description: android13-5.15
+        default: false
+        type: boolean
+      kmi_android14_5_15:
+        description: android14-5.15
+        default: false
+        type: boolean
+      kmi_android14_6_1:
+        description: android14-6.1
+        default: false
+        type: boolean
+      kmi_android15_6_6:
+        description: android15-6.6
+        default: false
+        type: boolean
+      kmi_android16_6_12:
+        description: android16-6.12
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  select-kmis:
+    name: Select KMI builds
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Generate build matrix
+        id: matrix
+        env:
+          BUILD_ALL: ${{ inputs.build_all }}
+          KMI_ANDROID12_5_10: ${{ inputs.kmi_android12_5_10 }}
+          KMI_ANDROID13_5_10: ${{ inputs.kmi_android13_5_10 }}
+          KMI_ANDROID13_5_15: ${{ inputs.kmi_android13_5_15 }}
+          KMI_ANDROID14_5_15: ${{ inputs.kmi_android14_5_15 }}
+          KMI_ANDROID14_6_1: ${{ inputs.kmi_android14_6_1 }}
+          KMI_ANDROID15_6_6: ${{ inputs.kmi_android15_6_6 }}
+          KMI_ANDROID16_6_12: ${{ inputs.kmi_android16_6_12 }}
+        run: |
+          set -euo pipefail
+          matrix="$(jq -cn '
+            (env.BUILD_ALL == "true") as $force_all |
+            [
+              {kmi: "android12-5.10", enabled: (if $force_all then true else (env.KMI_ANDROID12_5_10 == "true") end)},
+              {kmi: "android13-5.10", enabled: (if $force_all then true else (env.KMI_ANDROID13_5_10 == "true") end)},
+              {kmi: "android13-5.15", enabled: (if $force_all then true else (env.KMI_ANDROID13_5_15 == "true") end)},
+              {kmi: "android14-5.15", enabled: (if $force_all then true else (env.KMI_ANDROID14_5_15 == "true") end)},
+              {kmi: "android14-6.1",  enabled: (if $force_all then true else (env.KMI_ANDROID14_6_1 == "true") end)},
+              {kmi: "android15-6.6",  enabled: (if $force_all then true else (env.KMI_ANDROID15_6_6 == "true") end)},
+              {kmi: "android16-6.12", enabled: (if $force_all then true else (env.KMI_ANDROID16_6_12 == "true") end)}
+            ] | map(select(.enabled).kmi) as $selected
+              | (if $selected == [] then map(.kmi) else $selected end) as $kmis
+              | {include: ($kmis | map({kmi: .}))}')"
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.kmi }}
+    needs: select-kmis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-kmis.outputs.matrix) }}
+
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}
+      options: --privileged
+
+    env:
+      SRC_DIR: ${{ github.workspace }}/kernel/magic_hide
+      ARTIFACT: artifacts/magic_hide-${{ matrix.kmi }}.ko
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate DDK environment
+        run: |
+          set -euo pipefail
+          if [[ -z "${KDIR:-}" || ! -f "$KDIR/Makefile" ]]; then
+            echo "KDIR is not available in the DDK container: ${KDIR:-<empty>}" >&2
+            exit 1
+          fi
+
+          if ! command -v llvm-strip >/dev/null; then
+            echo "llvm-strip is not available in the DDK container" >&2
+            exit 1
+          fi
+
+          echo "KMI: ${{ matrix.kmi }}"
+          echo "KDIR: $KDIR"
+          clang --version
+          ld.lld --version
+
+      - name: Build module
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*' || true
+
+          # strip page pinner symbols from the DDK headers
+          for MM in /opt/ddk/src/*/include/linux/mm.h /opt/ddk/kdir/*/include/linux/mm.h; do
+            [ -f "$MM" ] || continue
+            if grep -q '^#include <linux/page_pinner.h>' "$MM"; then
+              cp "$MM" "$MM.orig"
+              sed -i 's|^#include <linux/page_pinner.h>|/* magic_hide CI: page_pinner disabled */|' "$MM"
+              sed -i 's|^\tpage_pinner_put_page(page);|\t/* magic_hide CI: page_pinner disabled */|' "$MM"
+            fi
+          done
+
+          make -j"$(nproc)" -C "$KDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 M="$SRC_DIR" modules
+
+      - name: Collect module
+        run: |
+          set -euo pipefail
+          install -Dm644 "$SRC_DIR/magic_hide.ko" "$ARTIFACT"
+          llvm-strip --strip-unneeded -R .BTF "$ARTIFACT"
+          ls -lh "$ARTIFACT"
+
+      - name: Upload module
+        uses: actions/upload-artifact@v7
+        with:
+          name: magic_hide-${{ matrix.kmi }}
+          path: artifacts
+          if-no-files-found: error
+
+  package:
+    name: Package lkm/
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download modules
+        uses: actions/download-artifact@v4
+        with:
+          pattern: magic_hide-*
+          path: lkm
+          merge-multiple: true
+
+      - name: List modules
+        run: |
+          set -euo pipefail
+          ls -lh lkm
+
+      - name: Upload lkm artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lkm
+          path: lkm
+          if-no-files-found: error
