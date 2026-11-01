@@ -7,6 +7,7 @@ mod defs;
 mod hide;
 mod parallel;
 mod restorecon;
+mod stats;
 mod utils;
 
 #[unsafe(no_mangle)]

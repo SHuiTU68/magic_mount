@@ -5,6 +5,7 @@ use crate::hide::{
 use crate::magic_mount::NodeFileType::{Directory, RegularFile, Symlink, Whiteout};
 use crate::parallel::par_map;
 use crate::restorecon::{lgetfilecon, lsetfilecon};
+use crate::stats::StageTimer;
 use crate::utils::get_work_dir;
 use crate::utils::ensure_dir_exists;
 use anyhow::{Context, Result, bail};
@@ -696,12 +697,17 @@ pub fn mount_tmp(mount_source: &str) -> Result<()> {
 }
 
 pub fn magic_mount(mount_source: &str) -> Result<()> {
+    // One clock read per phase: cheap enough to keep on in release builds and
+    // the only way to tell which stage a slow boot is spent in.
+    let mut timer = StageTimer::new();
     match collect_module_files()? {
         Some(root) => {
+            timer.mark("collect");
             log::debug!("collected: {root:#?}");
             // Snapshot the mount table before creating any workspace, so every
             // record describes the state we are about to cover, not ourselves.
             let mounts = MountTable::new();
+            timer.mark("snapshot");
             let tmp_dir = PathBuf::from(get_work_dir());
             log::info!("mount_dir: {}", tmp_dir.display());
             let ramdisk_tmp = tmp_dir.to_string_lossy().contains("ramdisk");
@@ -731,9 +737,11 @@ pub fn magic_mount(mount_source: &str) -> Result<()> {
             } else {
                 root
             };
+            timer.mark("workspace");
 
             let result =
                 do_magic_mount(Path::new("/"), &tmp_dir, root, false, &mounts, module_ro);
+            timer.mark("mount");
 
             if let Err(e) = unmount(&tmp_dir, UnmountFlags::DETACH) {
                 log::error!("failed to unmount tmp {}", e);
@@ -749,6 +757,7 @@ pub fn magic_mount(mount_source: &str) -> Result<()> {
                     log::error!("failed to unmount tmp /debug_ramdisk: {}", e);
                 }
             }
+            timer.mark("teardown");
 
             if result.is_ok() {
                 // Hand the final mountpoints and their pre-mount identity to
@@ -756,6 +765,8 @@ pub fn magic_mount(mount_source: &str) -> Result<()> {
                 // answers statfs()/stat() with the covered filesystem.
                 mounts.publish();
             }
+            timer.mark("publish");
+            timer.finish(mounts.len());
             result
         }
         _ => {

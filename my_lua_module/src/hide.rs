@@ -278,6 +278,12 @@ impl MountTable {
         self.lock().get(path.as_ref()).map(|n| n.m_flags)
     }
 
+    /// Number of mountpoints handed to the LKM; reported next to the stage
+    /// timings so a change in tree shape shows up alongside a change in time.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
     pub fn publish(&self) {
         let records = self.lock();
         if records.is_empty() {

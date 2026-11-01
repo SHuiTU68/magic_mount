@@ -259,6 +259,21 @@ check_identity() {
     done 3<"$WORK"
 }
 
+# Static per-boot timeline written by the Rust mount core; compare the digits
+# across builds instead of guessing whether a change made boot slower.
+check_timing() {
+    sec "timing (mount stage timer)"
+
+    f=/data/adb/modules/magic_mount/mount-stats.txt
+    if [ ! -r "$f" ]; then
+        skip "no stage timing yet (reboot once after installing this build)"
+        return
+    fi
+    while IFS= read -r line; do
+        printf '      %s\n' "$line"
+    done <"$f"
+}
+
 check_readonly() {
     sec "read-only behaviour (EROFS parity)"
 
@@ -341,6 +356,7 @@ printf 'magic_mount self check\n'
 check_hide
 check_mount_table
 check_identity
+check_timing
 check_readonly
 check_cleanup
 
