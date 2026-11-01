@@ -24,7 +24,10 @@
  *
  *   - show_mountinfo()/show_vfsmnt(): entry_handler records seq_file->count,
  *     return handler parses the freshly emitted line and, if its mountpoint
- *     belongs to a magic_mount target, rewinds seq_file->count;
+ *     belongs to a magic_mount target, rewinds seq_file->count.  A directory
+ *     target only hides the tmpfs skeleton stacked on it; the stock mount at
+ *     that mountpoint (an overlayfs over the product partition, for example)
+ *     stays listed, because a clean boot shows it too;
  *   - vfs_statfs()/vfs_getattr(): entry_handler resolves the mount root in the
  *     anchor table and copies the native f_type / dev / statfs counters into
  *     the per-instance data, return handler writes them into the caller's
@@ -300,30 +303,65 @@ static void mh_hot_clear(void)
 	atomic_set(&g_hot_stat, 0);
 }
 
+/* One parsed /proc mount line: what it points at and what it is made of. */
+struct mh_line {
+	char point[MH_PATH_MAX];
+	const char *fstype;
+	size_t fstype_len;
+	const char *root;
+	size_t root_len;
+	const char *source;
+	size_t source_len;
+	bool have_point;
+};
+
 /*
- * A mountpoint is hidden when it equals a recorded target or lies below one:
- * magic_mount replaces whole directories, so any sub-mount attached inside a
- * replaced directory belongs to the same workspace.
+ * The recorded name that covers `path`.  A mountpoint is hidden when it
+ * equals a recorded target or lies below one: magic_mount replaces whole
+ * directories, so any sub-mount attached inside a replaced directory belongs
+ * to the same workspace.
  */
-static bool mh_name_hidden(const char *path, size_t len)
+static struct mh_anchor *mh_name_match(const char *path, size_t len)
 {
-	struct mh_anchor *a;
-	bool hit = false;
+	struct mh_anchor *a, *best = NULL;
 
 	if (!len)
-		return false;
+		return NULL;
 
-	rcu_read_lock();
 	list_for_each_entry_rcu(a, &g_anchors, rule) {
 		if (a->name_len > len || memcmp(a->name, path, a->name_len))
 			continue;
-		if (a->name_len == len || path[a->name_len] == '/') {
-			hit = true;
-			break;
-		}
+		if (!(a->name_len == len || path[a->name_len] == '/'))
+			continue;
+		/*
+		 * The longest match wins: a module file record has to hide its own
+		 * bind even though the directory record above it also matches.
+		 */
+		if (!best || a->name_len > best->name_len)
+			best = a;
 	}
-	rcu_read_unlock();
-	return hit;
+	return best;
+}
+
+/*
+ * Does `a` hide this proc line?  A file record describes a bind of a module
+ * file, which has no stock counterpart, so the line goes away.  A directory
+ * record instead sits on an existing mountpoint: magic_mount stacks a tmpfs
+ * skeleton there while the stock mount beneath it (overlayfs on
+ * /product/overlay, for example) is part of a clean boot.  Hiding that stock
+ * line would make the mount table differ from stock, so only the tmpfs line
+ * is dropped.
+ */
+static bool mh_record_hides(const struct mh_anchor *a, const struct mh_line *l)
+{
+	/* A mount attached below a target is one of our mirrors or binds. */
+	if (a->name_len != strlen(l->point))
+		return true;
+	if (!a->have_path || !d_is_dir(a->path.dentry))
+		return true;
+	if (!l->fstype || !l->fstype_len)
+		return true;
+	return l->fstype_len == 5 && !memcmp(l->fstype, "tmpfs", 5);
 }
 
 static void mh_anchor_free(struct mh_anchor *a)
@@ -459,15 +497,6 @@ static bool mh_next_token(const char *buf, size_t len, size_t *pos,
 	return true;
 }
 
-struct mh_line {
-	char point[MH_PATH_MAX];
-	const char *root;
-	size_t root_len;
-	const char *source;
-	size_t source_len;
-	bool have_point;
-};
-
 /* "id parent dev root mountpoint opts... - fstype source superopts" */
 static bool mh_parse_mountinfo(const char *buf, size_t len, struct mh_line *l)
 {
@@ -480,7 +509,10 @@ static bool mh_parse_mountinfo(const char *buf, size_t len, struct mh_line *l)
 	while (mh_next_token(buf, len, &pos, &tok, &tlen)) {
 		if (tail) {
 			/* The fstype comes first, the source token second. */
-			if (tail == 2) {
+			if (tail == 1) {
+				l->fstype = tok;
+				l->fstype_len = tlen;
+			} else if (tail == 2) {
 				l->source = tok;
 				l->source_len = tlen;
 			}
@@ -518,6 +550,9 @@ static bool mh_parse_vfsmnt(const char *buf, size_t len, struct mh_line *l)
 		} else if (field == 1) {
 			l->have_point = mh_copy_unescaped(tok, tlen, l->point,
 							  sizeof(l->point));
+		} else if (field == 2) {
+			l->fstype = tok;
+			l->fstype_len = tlen;
 		}
 		field++;
 	}
@@ -537,7 +572,7 @@ static bool mh_parse_vfsstat(const char *buf, size_t len, struct mh_line *l)
 {
 	size_t pos = 0, tlen;
 	const char *tok;
-	bool want_dev = false;
+	bool want_dev = false, want_fstype = false;
 	unsigned int state = 0; /* 0 idle, 1 after "mounted", 2 after "on" */
 
 	memset(l, 0, sizeof(*l));
@@ -545,7 +580,8 @@ static bool mh_parse_vfsstat(const char *buf, size_t len, struct mh_line *l)
 		if (state == 2) {
 			l->have_point = mh_copy_unescaped(tok, tlen, l->point,
 							  sizeof(l->point));
-			break;
+			state = 0;
+			continue;
 		}
 		if (state == 1) {
 			if (tlen == 2 && !memcmp(tok, "on", 2)) {
@@ -560,8 +596,18 @@ static bool mh_parse_vfsstat(const char *buf, size_t len, struct mh_line *l)
 			want_dev = false;
 			continue;
 		}
+		if (want_fstype) {
+			l->fstype = tok;
+			l->fstype_len = tlen;
+			want_fstype = false;
+			continue;
+		}
 		if (tlen == 6 && !memcmp(tok, "device", 6)) {
 			want_dev = true;
+			continue;
+		}
+		if (tlen == 6 && !memcmp(tok, "fstype", 6)) {
+			want_fstype = true;
 			continue;
 		}
 		if (tlen == 7 && !memcmp(tok, "mounted", 7))
@@ -678,9 +724,17 @@ static bool mh_line_hidden(enum mh_kind kind, const char *buf, size_t len)
 
 	if (mh_ws_path_n(l.point, strlen(l.point)))
 		return true;
-	if (atomic_read(&g_anchor_count) &&
-	    mh_name_hidden(l.point, strlen(l.point)))
-		return true;
+	if (atomic_read(&g_anchor_count)) {
+		struct mh_anchor *a;
+		bool hide;
+
+		rcu_read_lock();
+		a = mh_name_match(l.point, strlen(l.point));
+		hide = a && mh_record_hides(a, &l);
+		rcu_read_unlock();
+		if (hide)
+			return true;
+	}
 	if (l.source && (mh_source_token(l.source, l.source_len) ||
 			 mh_staging_path(l.source, l.source_len)))
 		return true;
