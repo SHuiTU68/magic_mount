@@ -68,14 +68,46 @@ collect_pairs() {
     done | head -n 5
 }
 
-partition_of() {
-    case "$1" in
-    /vendor*) echo /vendor ;;
-    /product*) echo /product ;;
-    /system_ext*) echo /system_ext ;;
-    /odm*) echo /odm ;;
-    *) echo /system ;;
-    esac
+# The mount that really covers `path`.  magic_hide removes magic_mount's own
+# mounts from mountinfo, so the deepest remaining ancestor directory is the
+# identity a stock ROM reports there.  Comparing with the partition root is
+# wrong on ROMs that stack another filesystem on top of it:
+# `/product/overlay/*.apk` lives on an overlayfs mount with its own
+# anonymous major:minor, not on `/product` itself.
+expected_cover_of() {
+    rp=$(readlink -f "$1" 2>/dev/null) || rp=$1
+    printf '%s\n' "$rp" | awk '
+        NR == FNR { target = $0; next }
+        {
+            mp = $5
+            fs = ""
+            for (i = 7; i <= NF; i++)
+                if ($i == "-") { fs = $(i + 1); break }
+            # A tmpfs ancestor is the magic_mount skeleton, never the stock
+            # identity; on a symlinked partition its record name does not
+            # match, so it can still be listed here.
+            if (fs == "tmpfs")
+                next
+            if (mp == target)
+                next
+            if (mp == "/") {
+                if (best == "") best = "/"
+                next
+            }
+            n = length(mp)
+            if (n >= length(target))
+                next
+            if (substr(target, 1, n) != mp)
+                next
+            if (substr(target, n + 1, 1) != "/")
+                next
+            if (n > len) {
+                best = mp
+                len = n
+            }
+        }
+        END { print (best == "" ? "/" : best) }
+    ' - /proc/self/mountinfo
 }
 
 # Zero-byte write attempt: succeeds only if the mount is writable.
@@ -169,14 +201,14 @@ check_identity() {
 
     while read -r t src <&3; do
         [ -e "$t" ] || { skip "$t does not exist"; continue; }
-        part=$(partition_of "$t")
+        part=$(expected_cover_of "$t")
 
         d_t=$(stat -c %d "$t" 2>/dev/null)
         d_p=$(stat -c %d "$part" 2>/dev/null)
         if [ "$d_t" = "$d_p" ]; then
-            ok "st_dev of $t matches $part ($d_t)"
+            ok "st_dev of $t matches its covering mount $part ($d_t)"
         else
-            bad "st_dev of $t is $d_t, $part reports $d_p"
+            bad "st_dev of $t is $d_t, covering mount $part reports $d_p"
         fi
 
         # The target shares the module file's content, not its inode: magic_hide
@@ -207,9 +239,9 @@ check_identity() {
         m_p=$(stat -f -c %t "$part" 2>/dev/null)
         if [ -n "$m_t" ] && [ -n "$m_p" ]; then
             if [ "$m_t" = "$m_p" ]; then
-                ok "statfs type of $t matches $part ($m_t)"
+                ok "statfs type of $t matches its covering mount $part ($m_t)"
             else
-                bad "statfs type of $t is $m_t, $part reports $m_p"
+                bad "statfs type of $t is $m_t, covering mount $part reports $m_p"
             fi
         fi
 
@@ -219,9 +251,9 @@ check_identity() {
         b_p=$(df -k "$part" 2>/dev/null | awk 'NR==2 { print $2 }')
         if [ -n "$b_t" ] && [ -n "$b_p" ]; then
             if [ "$b_t" = "$b_p" ]; then
-                ok "statfs capacity of $t matches $part ($b_t 1K-blocks)"
+                ok "statfs capacity of $t matches its covering mount $part ($b_t 1K-blocks)"
             else
-                bad "$t reports $b_t 1K-blocks, $part reports $b_p"
+                bad "$t reports $b_t 1K-blocks, covering mount $part reports $b_p"
             fi
         fi
     done 3<"$WORK"
