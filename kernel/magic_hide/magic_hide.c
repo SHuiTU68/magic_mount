@@ -341,12 +341,14 @@ static bool mh_hide_for_current(void)
  * process list in hand, not guessed inside the kernel.
  */
 /*
- * The observer is compiled in unconditionally.  This DDK header snapshot
- * defines neither CONFIG_DYNAMIC_FTRACE nor CONFIG_FUNCTION_TRACER (verified
- * through the MODULE_INFO below), which used to compile the whole block out and
- * leave the LKM silently blind on a kernel that does ship ftrace.  The loader
- * resolves undefined symbols from kallsyms, so a kernel without the API simply
- * fails the u64 address handshake and reports the observer as unavailable.
+ * A hook is needed that answers "who is asking" without deciding the return
+ * value.  ftrace would be the natural choice, but this DDK header snapshot
+ * defines neither CONFIG_DYNAMIC_FTRACE nor CONFIG_FUNCTION_TRACER, and without
+ * them <linux/ftrace.h> only forward-declares struct ftrace_ops -- the observer
+ * cannot be compiled there at all.  The four syscall wrappers are therefore
+ * covered by plain kprobes, whose addresses userspace resolves from kallsyms
+ * (the wrappers are not reachable by symbol name on arm64).  Only the entry is
+ * probed and only during the boot window, then the probes are torn down.
  */
 #define MH_HAVE_FTRACE 1
 
@@ -362,8 +364,6 @@ module_param_named(addr_newfstatat, g_ft_ip[1], ulong, 0);
 module_param_named(addr_statfs, g_ft_ip[2], ulong, 0);
 module_param_named(addr_fstatfs, g_ft_ip[3], ulong, 0);
 
-
-
 struct mh_ev_slot {
 	u32 uid;
 	u32 pid;
@@ -378,6 +378,8 @@ static atomic_t g_ft_calls = ATOMIC_INIT(0);
 static atomic_t g_ft_matched = ATOMIC_INIT(0);
 static bool g_ft_filtered;
 static bool g_ft_armed;
+static struct kprobe g_ev_kp[4];
+static bool g_ev_live[4];
 
 static void mh_ft_hit(unsigned long ip)
 {
@@ -409,22 +411,15 @@ static void mh_ft_hit(unsigned long ip)
 	atomic_inc(&s->count);
 }
 
-static void mh_ft_cb(unsigned long ip, unsigned long parent_ip,
-		     struct ftrace_ops *ops, void *ctx)
+static int mh_ev_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	(void)parent_ip;
-	(void)ops;
-	(void)ctx;
+	(void)regs;
 	if (!atomic_read(&g_ev_on))
-		return;
+		return 0;
 	atomic_inc(&g_ft_calls);
-	mh_ft_hit(ip);
+	mh_ft_hit((unsigned long)p->addr);
+	return 0;
 }
-
-static struct ftrace_ops g_ft_ops = {
-	.func = (ftrace_func_t)mh_ft_cb,
-	.flags = FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_DYNAMIC,
-};
 
 static bool mh_ft_have_params(void)
 {
@@ -437,33 +432,40 @@ static void mh_ft_register(void)
 
 	if (g_ft_armed)
 		return;
-	if (!g_ft_filtered) {
-		for (i = 0; i < 4; i++) {
-			if (!g_ft_ip[i])
-				continue;
-			if (ftrace_set_filter_ip(&g_ft_ops, g_ft_ip[i], 0, 0))
-				pr_debug("cannot filter syscall %d\n", i);
-			else
-				armed++;
+	for (i = 0; i < 4; i++) {
+		memset(&g_ev_kp[i], 0, sizeof(g_ev_kp[i]));
+		if (!g_ft_ip[i])
+			continue;
+		g_ev_kp[i].pre_handler = mh_ev_pre;
+		g_ev_kp[i].addr = (kprobe_opcode_t *)g_ft_ip[i];
+		if (register_kprobe(&g_ev_kp[i]))
+			pr_debug("cannot probe syscall %d\n", i);
+		else {
+			g_ev_live[i] = true;
+			armed++;
 		}
-		if (!armed)
-			return;
-		g_ft_filtered = true;
 	}
-	if (register_ftrace_function(&g_ft_ops)) {
-		pr_debug("cannot register ftrace observer\n");
+	if (!armed)
 		return;
-	}
+	g_ft_filtered = true;
 	g_ft_armed = true;
 }
 
-/* Leaves no trampoline behind once the boot window is over. */
+/* Drops every entry probe once the boot window is over. */
 static void mh_ft_unregister(void)
 {
+	int i;
+
 	atomic_set(&g_ev_on, 0);
 	if (!g_ft_armed)
 		return;
-	unregister_ftrace_function(&g_ft_ops);
+	for (i = 0; i < 4; i++) {
+		if (g_ev_live[i]) {
+			unregister_kprobe(&g_ev_kp[i]);
+			g_ev_live[i] = false;
+		}
+	}
+	g_ft_filtered = false;
 	g_ft_armed = false;
 }
 
@@ -483,14 +485,7 @@ static int mh_set_addrs(const mh_u64 *in, mh_u32 n)
 	for (i = 0; i < n; i++)
 		ips[i] = in[i];
 
-	if (g_ft_armed) {
-		unregister_ftrace_function(&g_ft_ops);
-		g_ft_armed = false;
-	}
-	if (g_ft_filtered) {
-		ftrace_set_filter(&g_ft_ops, NULL, 0, 1);
-		g_ft_filtered = false;
-	}
+	mh_ft_unregister();
 	for (i = 0; i < 4; i++)
 		g_ft_ip[i] = (unsigned long)ips[i];
 
