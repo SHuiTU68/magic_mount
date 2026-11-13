@@ -14,6 +14,6 @@
     "authors": ["APatch Modules Team"],
     "license": "GPL-2.0-only",
     "moduleid": "magic_mount",
-    "version": "3",
-    "VersionCode": 3
+    "version": "4",
+    "VersionCode": 4
 }

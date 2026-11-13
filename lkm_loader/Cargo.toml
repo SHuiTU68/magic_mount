@@ -1,0 +1,16 @@
+[package]
+name = "lkm_loader"
+version = "1.0.0"
+edition = "2021"
+
+# No dependencies: this runs in post-fs-data, where a missing or mismatched
+# library is one more thing that can go wrong.  Everything below is std plus a
+# handful of bionic/libdl symbols.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

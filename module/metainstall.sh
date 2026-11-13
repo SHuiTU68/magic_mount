@@ -45,7 +45,7 @@ handle_partitions product
 handle_partitions odm
 
 # Say which KMIs this package carries: the LKM only loads on a matching
-# kernel, and lkm.sh degrades silently when none matches.
+# kernel, and lkm/loader degrades silently when none matches.
 if [ -d "$MODPATH/lkm" ]; then
 	say "- LKM: $(cd "$MODPATH/lkm" && ls magic_hide*.ko 2>/dev/null | tr '\n' ' ')"
 else
@@ -70,7 +70,7 @@ clean_old_files() {
 	find "$target" -type f | while IFS= read -r path; do
 		rel=${path#"$target"/}
 		case "$rel" in
-		files.list | module.prop | mount-stats.txt | disable | remove | skip_mount | update)
+		files.list | module.prop | mount-stats.txt | mount-failures | disable | remove | skip_mount | update)
 			continue
 			;;
 		esac
@@ -91,3 +91,7 @@ fi
 # Must stay last: install_module copies $MODPATH to /data, so anything created
 # above (the partition links in particular) is only packaged if it runs after.
 install_module
+
+# Installing a new build is the user's way out of the safe-mode skip, so the
+# consecutive-failure count starts from zero again.
+rm -f "${NVBASE:-/data/adb}/modules/${MODID:-magic_mount}/mount-failures"

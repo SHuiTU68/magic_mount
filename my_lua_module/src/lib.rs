@@ -51,6 +51,33 @@ unsafe extern "C-unwind" fn refresh_hide(state: *mut lua_State) -> c_int { unsaf
     1
 }}
 
+/// Plain C entry points used by lkm/loader.
+///
+/// The loader runs the mount pass in a child process so that a panic, a
+/// deadlock or a crash costs one boot instead of looping forever; it dlopens
+/// this library and calls these two symbols.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn magic_mount_exec(source: *const std::os::raw::c_char) -> c_int {
+    if source.is_null() {
+        return -1;
+    }
+    let Ok(source) = (unsafe { std::ffi::CStr::from_ptr(source) }).to_str() else {
+        return -1;
+    };
+    match magic_mount::magic_mount(source) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("magic_mount: {err:#}");
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn refresh_hide_exec() -> c_int {
+    if hide::refresh() { 0 } else { -1 }
+}
+
 // --------------------------
 // Lua require("libmagic_mount") 时执行的入口
 // --------------------------

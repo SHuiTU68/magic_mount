@@ -3,16 +3,16 @@
 -- The root manager calls one stage per boot, in this order:
 --
 --   post_fs_data   before any module is mounted      -> load the LKM
---   post_mount     after the module trees are up     -> publish + mount
+--   post_mount     after the module trees are up     -> mount, in a child
 --   service        late_start, every mount has landed-> rebind records
 --   boot_completed after the boot finished           -> final rebind
 --   action         user tapped the module in the app -> report
 --
 -- Every stage must survive on its own: the root manager runs metamodules in a
 -- chain, and an error thrown here would abort the stages of the modules after
--- us.  Anything that can fail (require of the native library, the mount pass,
--- the LKM loader) is therefore wrapped, and a failure only costs the hiding,
--- never the mount.
+-- us.  The heavy lifting lives in lkm/loader, which runs the mount pass in a
+-- child process with a deadline; if that binary is missing or cannot load the
+-- native library (exit code 2) the old in-process path is used instead.
 
 local M = {}
 
@@ -35,21 +35,29 @@ local function log(msg)
     end
 end
 
+-- Exit code of a command, or nil when it could not be run at all.
 local function run(cmd)
     if type(os.execute) ~= "function" then
-        return false
+        return nil
     end
     local ok, how, code = os.execute(cmd)
     if ok == true or ok == 0 then
-        return true
+        return 0
     end
-    return how == "exit" and code == 0
+    if how == "exit" then
+        return code or 1
+    end
+    return nil
 end
 
--- lkm.sh matches the shipped .ko against this device's KMI and exits quietly
--- when nothing matches, so "load" is always safe to call (also twice).
-local function lkm(action)
-    return run(("sh '%s/lkm.sh' %s"):format(moddir(), action or "load"))
+-- 126/127 come from the shell when the file is absent or not executable, which
+-- is the only case where the Lua fallback should take over.
+local function loader(action)
+    local code = run(("'%s/lkm/loader' %s"):format(moddir(), action))
+    if code == 126 or code == 127 then
+        return nil
+    end
+    return code
 end
 
 local function library()
@@ -61,64 +69,67 @@ local function library()
     return nil
 end
 
--- The kernel keys its hiding records on the root dentry of each covered
--- mount, so a mount created after post_mount has a different one.  Rebinding
--- keeps the identity sampled before the first mount and is idempotent, which
--- is why every later stage can call it.
-local function rebind()
+-- 2: the loader ran but could not dlopen the library.
+local function fallback_mount(source)
+    local lib = library()
+    if lib and type(lib.magic_mount) == "function" then
+        local ok, err = pcall(lib.magic_mount, source)
+        if not ok then
+            log("mount failed: " .. tostring(err))
+        end
+    end
+end
+
+local function fallback_refresh()
     local lib = library()
     if lib and type(lib.refresh_hide) == "function" then
         pcall(lib.refresh_hide)
     end
 end
 
-local function report()
-    local dir = moddir()
-    print("magic_mount: " .. (run("test -d /sys/module/magic_hide") and
-        "magic_hide loaded" or "magic_hide NOT loaded (mounts are not hidden)"))
-    run(("sh '%s/lkm.sh' status"):format(dir))
-    print("--- mount timings ---")
-    run(("cat '%s/mount-stats.txt' 2>/dev/null"):format(dir))
-end
-
 function M.version()
-    return 3
+    return 4
 end
 
 function M.post_fs_data(superkey)
     log("post_fs_data called")
-    lkm("load")
+    loader("load")
 end
 
 function M.post_mount(superkey)
     log("post_mount called")
-    -- Safety net for root managers that skip post_fs_data; lkm.sh exits
+    -- Safety net for root managers that skip post_fs_data; the loader exits
     -- immediately when the module is already loaded.
-    lkm("load")
+    loader("load")
 
-    local lib = library()
-    if not lib or type(lib.magic_mount) ~= "function" then
-        return
-    end
     local source = (superkey == "kernelsu") and "KSU" or "APatch"
-    local ok, err = pcall(lib.magic_mount, source)
-    if not ok then
-        log("mount failed: " .. tostring(err))
+    local code = loader("mount " .. source)
+    if code == nil or code == 2 then
+        fallback_mount(source)
     end
 end
 
 function M.service(superkey)
     log("service called")
-    rebind()
+    local code = loader("refresh")
+    if code == nil or code == 2 then
+        fallback_refresh()
+    end
 end
 
 function M.boot_completed(superkey)
     log("boot_completed called")
-    rebind()
+    local code = loader("refresh")
+    if code == nil or code == 2 then
+        fallback_refresh()
+    end
 end
 
 function M.action()
-    report()
+    if loader("status") == nil then
+        -- Older package without lkm/loader: report what we can from the shell.
+        run(("cat '%s/mount-stats.txt' 2>/dev/null"):format(moddir()))
+    end
 end
 
 return M

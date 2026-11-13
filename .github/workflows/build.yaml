@@ -38,12 +38,21 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: my_lua_module
+          workspaces: |
+            my_lua_module
+            lkm_loader
           cache-targets: false
       
       - name: Build Rust
         run: |
           cd my_lua_module
+          cargo ndk -t aarch64-linux-android -- build --release
+
+      # The KMI matching, insmod and the mount deadline all live in this
+      # binary; it replaces lkm.sh and is shipped as lkm/loader.
+      - name: Build loader
+        run: |
+          cd lkm_loader
           cargo ndk -t aarch64-linux-android -- build --release
 
       - name: Download lkm
@@ -59,6 +68,8 @@ jobs:
           upx --best --lzma --android-shlib build/libmagic_mount.so
           cp module/* build/
           cp lkm/*.ko build/lkm/
+          cp lkm_loader/target/aarch64-linux-android/release/lkm_loader build/lkm/loader
+          chmod 755 build/lkm/loader
           # The install script deletes files the previous version left behind
           # by diffing the installed tree against this list, so it has to be
           # generated last, from the exact payload that ships.
