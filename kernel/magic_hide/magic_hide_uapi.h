@@ -42,6 +42,7 @@ enum mh_cmd {
 	MH_CMD_ADD   = 1, /* append records (mountpoints + native metadata) */
 	MH_CMD_MODE  = 2, /* change the per-uid visibility policy           */
 	MH_CMD_OFF   = 3, /* RESET + MH_MODE_OFF                            */
+	MH_CMD_REFRESH = 4, /* re-resolve paths, keep the published identity */
 };
 
 enum mh_mode {

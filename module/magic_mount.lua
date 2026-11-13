@@ -39,6 +39,14 @@ function M.post_mount(superkey)
 end
 function M.service(superkey)
     info("service called")
+    -- Late-start stage: a mount created after post_mount (a partition the root
+    -- manager remounted, another metamodule landing later) has a new root
+    -- dentry, which no longer matches the records published earlier.  Rebinding
+    -- is idempotent and keeps the identity sampled before the first mount.
+    local ok, lib = pcall(require, "libmagic_mount")
+    if ok and lib.refresh_hide then
+        pcall(lib.refresh_hide)
+    end
 end
 
 function M.action()

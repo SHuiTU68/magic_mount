@@ -289,6 +289,8 @@ static int mh_hot_insert(struct mh_anchor *a)
 	return -ENOSPC;
 }
 
+static void mh_hot_register(void);
+
 /* Called with g_mutex held. */
 static void mh_hot_clear(void)
 {
@@ -396,6 +398,56 @@ static void mh_records_reset(void)
 		list_del(&a->dead);
 		mh_anchor_free(a);
 	}
+}
+
+/*
+ * Rebind the published identity to the mounts that exist right now.
+ *
+ * The hot table is keyed by the root dentry of each covered mount, which is
+ * what makes a lookup a single hash probe.  A dentry is only valid for one
+ * mount instance though: if anything mounts over a target again (a root
+ * manager remounting a partition, a module installed later, a bind redone),
+ * the new mount has a fresh root dentry and every published record silently
+ * stops matching.  Re-resolving the recorded paths repairs that without
+ * touching the sampled identity (dev, f_type, inode), so a late mount is
+ * handled the same way as one that existed at publish time.
+ *
+ * Runs from ->preparse(), i.e. process context, so kern_path() may sleep.
+ */
+static int mh_records_refresh(void)
+{
+	struct mh_anchor *a;
+	int ret = 0;
+
+	mutex_lock(&g_mutex);
+	mh_hot_clear();
+	list_for_each_entry(a, &g_anchors, rule) {
+		struct path p;
+
+		/* procfs-only record: there is no mount to bind to. */
+		if (!a->flags)
+			continue;
+		/* Path gone: keep the old dentry so nothing regresses. */
+		if (kern_path(a->name, LOOKUP_FOLLOW, &p)) {
+			pr_debug("magic_hide: cannot re-resolve %s\n", a->name);
+			if (a->have_path && mh_hot_insert(a) < 0)
+				ret = -ENOSPC;
+			continue;
+		}
+		if (a->have_path)
+			path_put(&a->path);
+		a->path = p;
+		a->have_path = true;
+		if (mh_hot_insert(a) < 0) {
+			path_put(&a->path);
+			a->have_path = false;
+			ret = -ENOSPC;
+		}
+	}
+	mutex_unlock(&g_mutex);
+
+	mh_hot_register();
+	return ret;
 }
 
 static int mh_records_add(const char *name, unsigned int len, u32 flags,
@@ -1192,6 +1244,9 @@ static int mh_process_payload(unsigned long user_addr)
 		break;
 	case MH_CMD_ADD:
 		ret = mh_payload_add(pl);
+		break;
+	case MH_CMD_REFRESH:
+		ret = mh_records_refresh();
 		break;
 	default:
 		ret = -EINVAL;

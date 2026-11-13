@@ -38,6 +38,7 @@ const MH_BUF_MAX: usize = MH_PAGE_SIZE - std::mem::size_of::<Uhdr>();
 const MH_CMD_RESET: u32 = 0;
 const MH_CMD_ADD: u32 = 1;
 const MH_CMD_MODE: u32 = 2;
+const MH_CMD_REFRESH: u32 = 4;
 
 const MH_MODE_ALL: u32 = 1;
 
@@ -362,6 +363,21 @@ impl MountTable {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Native>> {
         self.records.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Ask the LKM to rebind the published identity to the mounts that exist now.
+///
+/// The kernel keys its lookup on the covered mount's root dentry, so a mount
+/// created after `publish()` (a root manager remounting a partition, a module
+/// installed later, a bind redone) carries a different dentry and the old
+/// records stop matching.  Refreshing re-resolves the stored paths and keeps
+/// the identity that was sampled before the first mount, so calling this at
+/// every later lifecycle stage is safe and idempotent.
+pub fn refresh() -> bool {
+    match Payload::new() {
+        Some(mut payload) => payload.send(MH_CMD_REFRESH, 0, 0),
+        None => false,
     }
 }
 

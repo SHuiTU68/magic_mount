@@ -41,6 +41,16 @@ unsafe extern "C-unwind" fn magic_mount(state: *mut lua_State) -> c_int { unsafe
 
     
 }}
+/// Rebind the already published hiding records to the current mounts.
+///
+/// Called from the late-start service stage: a mount created after the first
+/// publish has a new root dentry, and the LKM's lookup is keyed on it.
+unsafe extern "C-unwind" fn refresh_hide(state: *mut lua_State) -> c_int { unsafe {
+    let ok = hide::refresh();
+    lua_pushboolean(state, if ok { 1 } else { 0 });
+    1
+}}
+
 // --------------------------
 // Lua require("libmagic_mount") 时执行的入口
 // --------------------------
@@ -67,5 +77,8 @@ pub unsafe extern "C" fn luaopen_libmagic_mount(state: *mut lua_State) -> c_int 
 
     lua_pushcfunction(state, magic_mount);
     lua_setfield(state, -2, b"magic_mount\0".as_ptr() as _);
+
+    lua_pushcfunction(state, refresh_hide);
+    lua_setfield(state, -2, b"refresh_hide\0".as_ptr() as _);
     1
 }}
