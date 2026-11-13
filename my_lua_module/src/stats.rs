@@ -14,9 +14,8 @@
 //! to the total.  Nothing is printed to dmesg: a log line naming the module
 //! would itself be a fingerprint.
 
-use crate::defs::STATS_PATH;
+use crate::moddir;
 use std::io::Write;
-use std::path::Path;
 use std::time::Instant;
 
 pub struct StageTimer {
@@ -54,7 +53,7 @@ impl StageTimer {
         for (name, us) in &self.stages {
             text.push_str(&format!("  stage={name} us={us}\n"));
         }
-        if let Ok(mut file) = std::fs::File::create(Path::new(STATS_PATH)) {
+        if let Ok(mut file) = std::fs::File::create(moddir::path().join("mount-stats.txt")) {
             let _ = file.write_all(text.as_bytes());
         }
     }

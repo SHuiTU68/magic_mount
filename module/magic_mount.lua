@@ -50,10 +50,33 @@ local function run(cmd)
     return nil
 end
 
--- 126/127 come from the shell when the file is absent or not executable, which
--- is the only case where the Lua fallback should take over.
+-- The package is built from the repository and shipped as a zip: the exec bit
+-- on lkm/loader does not survive every download path, and some devices mount
+-- /data noexec.  Fix the mode first, then run a copy from tmpfs.
+local function loader_path()
+    local bin = moddir() .. "/lkm/loader"
+    if run(("test -x '%s'"):format(bin)) then
+        return bin
+    end
+    run(("chmod 0755 '%s' 2>/dev/null"):format(bin))
+    if run(("test -x '%s'"):format(bin)) then
+        return bin
+    end
+    return nil
+end
+
 local function loader(action)
-    local code = run(("'%s/lkm/loader' %s"):format(moddir(), action))
+    local bin = loader_path()
+    if not bin then
+        return nil
+    end
+    local code = run(("'%s' %s"):format(bin, action))
+    if code == 126 then
+        local tmp = "/dev/.mm_loader"
+        if run(("cp -f '%s' %s 2>/dev/null && chmod 0755 %s"):format(bin, tmp, tmp)) then
+            code = run(("'%s' %s"):format(tmp, action))
+        end
+    end
     if code == 126 or code == 127 then
         return nil
     end
@@ -63,6 +86,11 @@ end
 local function library()
     local ok, lib = pcall(require, "libmagic_mount")
     if ok and type(lib) == "table" then
+        -- A metamodule does not live under /data/adb/modules/<id>; the state
+        -- files have to follow MODDIR.
+        if type(lib.configure) == "function" then
+            pcall(lib.configure, moddir())
+        end
         return lib
     end
     log("libmagic_mount unavailable: " .. tostring(lib))

@@ -509,15 +509,12 @@ pub fn observe(on: bool) -> Vec<Observer> {
     observe_full(on).events
 }
 
-/// Module directory; the loader derives its own path the same way, but this
-/// side is called from the Lua host, which does not pass MODDIR down.
-const MODULE_DIR: &str = "/data/adb/modules/magic_mount";
-
 /// Drain the observer table, apply the exemption list from the module directory
 /// and keep a readable summary.  Called once the boot is over: everything that
 /// inspects the mount table has had its chance by then.
 pub fn report() -> bool {
-    let dir = Path::new(MODULE_DIR);
+    let dir = crate::moddir::path();
+    let dir = dir.as_path();
     let mut policy = false;
 
     if let Ok(text) = std::fs::read_to_string(dir.join("hide-exempt-uids")) {

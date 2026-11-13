@@ -86,18 +86,30 @@ clean_old_files() {
 
 if [ -n "$MODPATH" ] && [ -d "$MODPATH" ]; then
 	clean_old_files "${NVBASE:-/data/adb}/modules/${MODID:-magic_mount}"
+	clean_old_files "${NVBASE:-/data/adb}/metamodule"
 fi
 
 # Must stay last: install_module copies $MODPATH to /data, so anything created
 # above (the partition links in particular) is only packaged if it runs after.
+chmod 0755 "$MODPATH/lkm/loader" 2>/dev/null
 install_module
 
-target="${NVBASE:-/data/adb}/modules/${MODID:-magic_mount}"
+# APatch installs a metamodule in /data/adb/metamodule, not in the Magisk
+# module directory, so every path here has to be tried in both places.
+installed_dirs() {
+	printf '%s\n' \
+		"$MODPATH" \
+		"${NVBASE:-/data/adb}/metamodule" \
+		"${NVBASE:-/data/adb}/modules/${MODID:-magic_mount}"
+}
 
-# Installing a new build is the user's way out of the safe-mode skip, so the
-# consecutive-failure count starts from zero again.
-rm -f "$target/mount-failures"
-
-# The loader is executed directly by the metamodule; a zip that lost the mode
-# would make lkm/loader exit 126 and the module would silently mount nothing.
-chmod 755 "$MODPATH/lkm/loader" "$target/lkm/loader" 2>/dev/null
+installed_dirs | while IFS= read -r dir; do
+	[ -f "$dir/module.prop" ] || continue
+	grep -qx 'id=magic_mount' "$dir/module.prop" || continue
+	# A zip that went through a download that drops modes makes lkm/loader exit
+	# 126, and the module would silently mount nothing.
+	chmod 0755 "$dir/lkm/loader" 2>/dev/null
+	# Installing a new build is the user's way out of the safe-mode skip.
+	rm -f "$dir/mount-failures"
+	clean_old_files "$dir"
+done

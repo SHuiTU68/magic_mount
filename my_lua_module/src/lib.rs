@@ -5,6 +5,7 @@ use android_logger::Config;
 mod magic_mount;
 mod defs;
 mod hide;
+mod moddir;
 mod parallel;
 mod restorecon;
 mod stats;
@@ -41,6 +42,21 @@ unsafe extern "C-unwind" fn magic_mount(state: *mut lua_State) -> c_int { unsafe
 
     
 }}
+/// Tell the library where this module lives.
+///
+/// A metamodule is not under /data/adb/modules/<id> (APatch uses
+/// /data/adb/metamodule), so the state files would otherwise land in a
+/// directory that does not exist.  The Lua host passes MODDIR once per stage.
+unsafe extern "C-unwind" fn configure_dir(state: *mut lua_State) -> c_int { unsafe {
+    let dir = lua_tolstring(state, 1, std::ptr::null_mut());
+    if !dir.is_null() {
+        if let Ok(dir) = std::ffi::CStr::from_ptr(dir).to_str() {
+            moddir::set(dir);
+        }
+    }
+    0
+}}
+
 /// Rebind the already published hiding records to the current mounts.
 ///
 /// Called from the late-start service stage: a mount created after the first
@@ -136,6 +152,9 @@ pub unsafe extern "C" fn luaopen_libmagic_mount(state: *mut lua_State) -> c_int 
     });
     
     lua_newtable(state);
+
+    lua_pushcfunction(state, configure_dir);
+    lua_setfield(state, -2, b"configure\0".as_ptr() as _);
 
     lua_pushcfunction(state, magic_mount);
     lua_setfield(state, -2, b"magic_mount\0".as_ptr() as _);
