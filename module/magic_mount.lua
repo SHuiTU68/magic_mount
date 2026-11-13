@@ -141,9 +141,10 @@ local function fallback_refresh()
     end
 end
 
--- Caller observation is driven by the LKM's ftrace probe on the stat
+-- Caller observation is driven by the LKM's kprobe entry probes on the stat
 -- syscalls.  Turning it on costs one atomic read per stat; the table is
--- drained once at boot_completed and written to hide-events.log.
+-- drained once at boot_completed and written to hide-events.log.  Separately,
+-- every positive hot lookup is counted into a hit table (hide-hits.log).
 local function observe(on)
     local lib = library()
     if lib and type(lib.observe_hide) == "function" then
@@ -159,7 +160,7 @@ local function report()
 end
 
 function M.version()
-    return 4
+    return 5
 end
 
 function M.post_fs_data(superkey)
@@ -197,7 +198,8 @@ function M.boot_completed(superkey)
         fallback_refresh()
     end
     -- Everything that inspects the mount table has run by now: close the
-    -- observer, apply hide-exempt-uids and keep the summary.
+    -- observer, drain the hit table, apply hide-exempt-uids and keep the
+    -- summary plus the exemption suggestion draft.
     report()
 end
 

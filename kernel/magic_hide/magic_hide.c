@@ -174,6 +174,7 @@ struct mh_anchor {
 	char *name;            /* raw mountpoint, no escaping       */
 	unsigned int name_len;
 	u32 flags;
+	u32 id;                /* publish order, used by the hit table */
 	u64 dev;
 	u64 f_type;
 	u32 m_flags;           /* statfs().f_flags of the covered mount */
@@ -572,6 +573,87 @@ static bool mh_ft_have_params(void)
 
 #endif /* MH_HAVE_FTRACE */
 
+/*
+ * Who touched a covered mount.  Unlike the syscall observer above, this needs no
+ * probes of its own: it is incremented in the hot path only after a lookup has
+ * already matched a published record, so it answers "who looked at the thing we
+ * are hiding" instead of "who called stat".  The table is a fixed 32 buckets of
+ * (uid, record id), which fits in one page together with its header.
+ */
+static DEFINE_SPINLOCK(g_hit_mu);
+static atomic_t g_hit_on = ATOMIC_INIT(0);
+static struct mh_uhit g_hits[MH_HIT_MAX];
+
+static void mh_hit_clear(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_hit_mu, flags);
+	memset(g_hits, 0, sizeof(g_hits));
+	spin_unlock_irqrestore(&g_hit_mu, flags);
+}
+
+static void mh_hit_record(u32 id)
+{
+	u32 uid = (u32)__kuid_val(current_fsuid());
+	unsigned long flags;
+	int i, slot = -1;
+
+	if (!atomic_read(&g_hit_on))
+		return;
+
+	spin_lock_irqsave(&g_hit_mu, flags);
+	for (i = 0; i < MH_HIT_MAX; i++) {
+		if (!g_hits[i].count) {
+			if (slot < 0)
+				slot = i;
+			continue;
+		}
+		if (g_hits[i].uid == uid && g_hits[i].id == id) {
+			g_hits[i].count++;
+			spin_unlock_irqrestore(&g_hit_mu, flags);
+			return;
+		}
+	}
+	if (slot < 0) {
+		/* Full: evict the least seen bucket so a noisy caller cannot
+		 * crowd out the rare one we care about. */
+		u64 min = ~0ull;
+
+		for (i = 0; i < MH_HIT_MAX; i++) {
+			if (g_hits[i].count < min) {
+				min = g_hits[i].count;
+				slot = i;
+			}
+		}
+	}
+	g_hits[slot].uid = uid;
+	g_hits[slot].id = id;
+	g_hits[slot].count = 1;
+	memcpy(g_hits[slot].comm, current->comm, MH_COMM_LEN);
+	g_hits[slot].comm[MH_COMM_LEN - 1] = 0;
+	spin_unlock_irqrestore(&g_hit_mu, flags);
+}
+
+static u32 mh_hits_dump(struct mh_upayload *pl, bool on)
+{
+	struct mh_uhit *out = (struct mh_uhit *)pl->buf;
+	unsigned long flags;
+	u32 i, n = 0;
+
+	atomic_set(&g_hit_on, on ? 1 : 0);
+
+	spin_lock_irqsave(&g_hit_mu, flags);
+	for (i = 0; i < MH_HIT_MAX; i++) {
+		if (!g_hits[i].count)
+			continue;
+		out[n++] = g_hits[i];
+		memset(&g_hits[i], 0, sizeof(g_hits[i]));
+	}
+	spin_unlock_irqrestore(&g_hit_mu, flags);
+	return n;
+}
+
 /* ------------------------------------------------------------------ */
 /* anchor table                                                        */
 /* ------------------------------------------------------------------ */
@@ -731,6 +813,10 @@ static void mh_records_reset(void)
 	atomic_set(&g_anchor_count, 0);
 	mutex_unlock(&g_mutex);
 
+	/* Record ids restart at 0, so stale hit buckets would point at the
+	 * wrong path after a republish. */
+	mh_hit_clear();
+
 	synchronize_rcu();
 
 	list_for_each_entry_safe(a, tmp, &dead_list, dead) {
@@ -825,6 +911,7 @@ static int mh_records_add(const char *name, unsigned int len, u32 flags,
 	mutex_lock(&g_mutex);
 	if (!a->have_path || !a->flags || mh_hot_insert(a) < 0)
 		a->flags = 0; /* procfs hiding only */
+	a->id = (u32)atomic_read(&g_anchor_count);
 	list_add_tail_rcu(&a->rule, &g_anchors);
 	atomic_inc(&g_anchor_count);
 	mutex_unlock(&g_mutex);
@@ -1299,6 +1386,8 @@ static int mh_hot_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 	if (a && (a->flags & need)) {
 		u32 flags = a->flags & need;
 
+		mh_hit_record(a->id);
+
 		/*
 		 * st_dev describes a filesystem and is valid for every path in
 		 * the mount.  st_ino/size/blocks/nlink describe one inode, so
@@ -1609,6 +1698,10 @@ static int mh_process_payload(unsigned long user_addr)
 	case MH_CMD_EVENTS:
 		pl->hdr.count = mh_events_dump(pl, pl->hdr.mode != 0);
 		pl->hdr.data_size = pl->hdr.count * (u32)sizeof(struct mh_uevent);
+		break;
+	case MH_CMD_HITS:
+		pl->hdr.count = mh_hits_dump(pl, pl->hdr.mode != 0);
+		pl->hdr.data_size = pl->hdr.count * (u32)sizeof(struct mh_uhit);
 		break;
 	default:
 		ret = -EINVAL;

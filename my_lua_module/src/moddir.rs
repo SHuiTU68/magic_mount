@@ -2,7 +2,8 @@
 //!
 //! A metamodule is not installed under /data/adb/modules/<id>: APatch keeps it
 //! in /data/adb/metamodule and hands the path to Lua as MODDIR.  The Rust side
-//! writes hidden state (mount-stats.txt, hide-events.log, hide-exempt-uids)
+//! writes hidden state (mount-stats.txt, hide-events.log, hide-hits.log,
+//! hide-exempt-uids and its suggestion draft)
 //! next to the module, so it has to learn that path instead of assuming the
 //! Magisk layout.  Defaults to the Magisk layout when nothing was configured.
 

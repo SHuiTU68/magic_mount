@@ -309,6 +309,37 @@ check_observers() {
     fi
 }
 
+# Which uids actually landed on a mountpoint we cover, plus the exemption
+# suggestions derived from that table.  Both are written once at boot_completed.
+check_hits() {
+    sec "hits (callers that reached a covered mount)"
+
+    d=$(mmdir)
+    f=$d/hide-hits.log
+    if [ -z "$d" ] || [ ! -r "$f" ]; then
+        skip "no hit table (older build, or no hot lookup matched)"
+        return
+    fi
+    n=0
+    while read -r uid mount cnt comm; do
+        case "$uid" in ''|'#'*) continue ;; esac
+        n=$((n + 1))
+        [ "$n" -le 8 ] || continue
+        printf '      uid=%-6s %8s  %-40s %s\n' "$uid" "$cnt" "$mount" "$comm"
+    done <"$f"
+    if [ "$n" -eq 0 ]; then
+        info "no covered mount was reached during boot"
+    else
+        info "$n uid/mount bucket(s) recorded"
+    fi
+
+    s=$d/hide-exempt-uids.suggested
+    if [ -r "$s" ]; then
+        m=$(grep -vc '^#' "$s" 2>/dev/null)
+        info "${m:-0} exempt uid(s) suggested (not applied)"
+    fi
+}
+
 check_readonly() {
     sec "read-only behaviour (EROFS parity)"
 
@@ -393,6 +424,7 @@ check_mount_table
 check_identity
 check_timing
 check_observers
+check_hits
 check_readonly
 check_cleanup
 

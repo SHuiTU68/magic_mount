@@ -94,8 +94,9 @@ unsafe extern "C-unwind" fn observe_hide(state: *mut lua_State) -> c_int { unsaf
     1
 }}
 
-/// Apply `hide-exempt-uids`, drain the observer table and write
-/// `hide-events.log`.  Called at boot_completed.
+/// Apply `hide-exempt-uids`, drain the hit and observer tables, then write
+/// `hide-hits.log`, `hide-exempt-uids.suggested` and `hide-events.log`.  Called
+/// at boot_completed.
 unsafe extern "C-unwind" fn report_hide(state: *mut lua_State) -> c_int { unsafe {
     let ok = hide::report();
     lua_pushboolean(state, if ok { 1 } else { 0 });

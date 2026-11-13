@@ -30,7 +30,7 @@ typedef int32_t  mh_s32;
 
 #define MH_PAGE_SIZE        4096u
 #define MH_PAYLOAD_MAGIC    0x4d485359u /* "MHSY" */
-#define MH_PAYLOAD_VERSION  5u /* 5: CONFIG (ftrace addresses) */
+#define MH_PAYLOAD_VERSION  6u /* 6: HITS (per-uid hit buckets) */
 #define MH_PATH_MAX         512
 
 /* Key type used by the LKM; add_key() is cancelled right after it runs. */
@@ -46,6 +46,7 @@ enum mh_cmd {
 	MH_CMD_POLICY = 5, /* replace the exempt uid set (process-level)     */
 	MH_CMD_EVENTS = 6, /* dump observed syscall callers, then clear      */
 	MH_CMD_CONFIG = 7, /* deliver the four ftrace addresses (u64[])      */
+	MH_CMD_HITS = 8,   /* dump who touched covered mounts, then clear    */
 };
 
 enum mh_mode {
@@ -104,6 +105,22 @@ struct mh_uevent {
 	mh_u32 pid;
 	mh_u32 op;
 	mh_u32 count;
+	mh_u8 comm[MH_COMM_LEN];
+};
+
+/*
+ * One "who touched a covered mount" bucket: uid x published record.  Counted in
+ * the hot path only after a lookup already matched, so it costs a linear scan
+ * of a 32 entry table and nothing at all when the switch is off.
+ * id indexes the record order used by MH_CMD_ADD; the module maps it back to a
+ * path, which keeps the payload small enough for one page.
+ */
+#define MH_HIT_MAX 32
+
+struct mh_uhit {
+	mh_u32 uid;
+	mh_u32 id;
+	mh_u64 count;
 	mh_u8 comm[MH_COMM_LEN];
 };
 

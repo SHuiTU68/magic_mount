@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MH_PAGE_SIZE: usize = 4096;
 const MH_PAYLOAD_MAGIC: u32 = 0x4d48_5359; // "MHSY"
-const MH_PAYLOAD_VERSION: u32 = 5; // 5: CONFIG (ftrace addresses)
+const MH_PAYLOAD_VERSION: u32 = 6; // 6: HITS (per-uid hit buckets)
 const MH_PATH_MAX: usize = 512;
 const MH_BUF_MAX: usize = MH_PAGE_SIZE - std::mem::size_of::<Uhdr>();
 
@@ -42,6 +42,7 @@ const MH_CMD_REFRESH: u32 = 4;
 const MH_CMD_POLICY: u32 = 5;
 const MH_CMD_EVENTS: u32 = 6;
 const MH_CMD_CONFIG: u32 = 7;
+const MH_CMD_HITS: u32 = 8;
 
 const MH_MODE_ALL: u32 = 1;
 
@@ -308,6 +309,7 @@ impl MountTable {
         }
 
         let mut i = 0;
+        let mut published: Vec<PathBuf> = Vec::with_capacity(entries.len());
         while i < entries.len() {
             let mut n = 0usize;
             let mut strings = 0usize;
@@ -356,11 +358,19 @@ impl MountTable {
             if !payload.send(MH_CMD_ADD, n as u32, off as u32) {
                 break;
             }
+            published.extend(entries[i..i + n].iter().map(|(p, _)| p.clone()));
             i += n;
         }
 
         // Hide from every uid, including the root zygote_next services.
         payload.send(MH_CMD_MODE, 0, 0);
+        // Start counting which uids actually reach a covered mount.  The kernel
+        // only increments after a hot lookup already matched, and the table is
+        // drained once by report(); until then it costs a 32 slot scan.
+        payload.send_mode(MH_CMD_HITS, 1, 0, 0);
+        // The kernel names a hit bucket by the index of the record it matched,
+        // so keep the same order to resolve an id back to a path later.
+        *RECORDS.lock().unwrap_or_else(|e| e.into_inner()) = published;
         log::info!("published {} mountpoints to magic_hide", entries.len());
     }
 
@@ -553,6 +563,77 @@ pub fn observe(on: bool) -> Vec<Observer> {
     observe_full(on).events
 }
 
+const MH_HIT_MAX: usize = 32;
+
+/// Wire layout of `struct mh_uhit`: one (uid, published record) bucket.  The
+/// record is referenced by index rather than by path so 32 buckets still fit in
+/// the single payload page.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Uhit {
+    uid: u32,
+    id: u32,
+    count: u64,
+    comm: [u8; MH_COMM_LEN],
+}
+
+/// One caller that actually landed on a mountpoint magic_mount covers.  Unlike
+/// an observer event this is a positive match, so it says which path was seen.
+#[derive(Clone)]
+pub struct Hit {
+    pub uid: u32,
+    pub count: u64,
+    pub path: PathBuf,
+    comm: [u8; MH_COMM_LEN],
+}
+
+impl Hit {
+    /// `comm` is a fixed 16-byte field, not necessarily NUL terminated.
+    pub fn comm(&self) -> String {
+        let end = self.comm.iter().position(|c| *c == 0).unwrap_or(MH_COMM_LEN);
+        String::from_utf8_lossy(&self.comm[..end]).into_owned()
+    }
+}
+
+/// Publication order of the mountpoints last handed to the LKM; `mh_uhit.id`
+/// is an index into this list.
+static RECORDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Drain the kernel's hit buckets.  `on` re-arms collection after the drain:
+/// the first call right after publishing starts it, the report call stops it.
+pub fn hits(on: bool) -> Vec<Hit> {
+    let Some(mut payload) = Payload::new() else {
+        return Vec::new();
+    };
+    if !payload.send_mode(MH_CMD_HITS, u32::from(on), 0, 0) {
+        return Vec::new();
+    }
+    let records = RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    let count = (payload.hdr().count as usize).min(MH_HIT_MAX);
+    let buf = payload.buf_mut();
+    (0..count)
+        .map(|i| {
+            // SAFETY: the kernel wrote `count` Uhit records at the start of the
+            // buffer and Uhit is repr(C) with no padding.
+            let hit: Uhit = unsafe {
+                std::ptr::read_unaligned(
+                    buf.as_ptr().add(i * std::mem::size_of::<Uhit>()) as *const Uhit
+                )
+            };
+            let path = records.get(hit.id as usize).cloned().unwrap_or_else(|| {
+                PathBuf::from(format!("<record {}>", hit.id))
+            });
+            Hit {
+                uid: hit.uid,
+                count: hit.count,
+                path,
+                comm: hit.comm,
+            }
+        })
+        .collect()
+}
+
 /// Drain the observer table, apply the exemption list from the module directory
 /// and keep a readable summary.  Called once the boot is over: everything that
 /// inspects the mount table has had its chance by then.
@@ -561,16 +642,23 @@ pub fn report() -> bool {
     let dir = dir.as_path();
     let mut policy = false;
     let mut exempt_n = 0usize;
+    let mut exempt: Vec<u32> = Vec::new();
 
     if let Ok(text) = std::fs::read_to_string(dir.join("hide-exempt-uids")) {
-        let uids: Vec<u32> = text
+        exempt = text
             .lines()
             .filter_map(|line| line.split('#').next())
             .filter_map(|line| line.trim().parse().ok())
             .collect();
-        exempt_n = uids.len();
-        policy = set_exempt(&uids);
+        exempt_n = exempt.len();
+        policy = set_exempt(&exempt);
     }
+
+    // Drain what actually reached a covered mount during boot.  This also
+    // stops collection, so it has to happen after every hot lookup has had a
+    // chance and before the log is written.
+    let touched = hits(false);
+    write_hits(dir, &touched, &exempt);
 
     // Arm once more so the status bits describe a registered probe, take the
     // drain, then tear the trampoline down for good.
@@ -628,7 +716,55 @@ pub fn report() -> bool {
     if !sorted.is_empty() {
         log::info!("magic_hide saw {} distinct callers", sorted.len());
     }
-    policy || !sorted.is_empty()
+    policy || !sorted.is_empty() || !touched.is_empty()
+}
+
+/// Keep the per-mount hit table and turn the uids that repeatedly landed on a
+/// covered mount into a *suggestion*.  The exemption list is never rewritten
+/// here: the operator copies the lines they trust, so a mis-detection cannot
+/// silently un-hide a partition for an app.
+fn write_hits(dir: &Path, touched: &[Hit], exempt: &[u32]) {
+    let mut sorted = touched.to_vec();
+    sorted.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let mut log = String::from("# magic_hide hits: uid mount count comm\n");
+    for h in &sorted {
+        log.push_str(&format!(
+            "{} {} {} {}\n",
+            h.uid,
+            h.path.display(),
+            h.count,
+            h.comm()
+        ));
+    }
+    let _ = std::fs::write(dir.join("hide-hits.log"), log);
+
+    // Only uids that clearly belong to apps and were seen more than once are
+    // worth suggesting: a single lookup is usually a probe that should stay
+    // hidden, while uid 0 / system uids must keep the faked view.
+    let mut sugg: Vec<(u32, u64)> = Vec::new();
+    for h in &sorted {
+        if h.uid < 10000 || h.uid == u32::MAX || exempt.contains(&h.uid) || h.count < 3 {
+            continue;
+        }
+        match sugg.iter_mut().find(|(uid, _)| *uid == h.uid) {
+            Some((_, count)) => *count += h.count,
+            None => sugg.push((h.uid, h.count)),
+        }
+    }
+    sugg.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut draft = String::from(
+        "# magic_hide suggestion: app uids seen on covered mounts (>= 3 times).\n\
+         # Copy a line into hide-exempt-uids to stop hiding from that uid; nothing is applied automatically.\n",
+    );
+    for (uid, count) in &sugg {
+        draft.push_str(&format!("{uid} # seen {count} times\n"));
+    }
+    let _ = std::fs::write(dir.join("hide-exempt-uids.suggested"), draft);
+    if !sugg.is_empty() {
+        log::info!("magic_hide hit table suggests {} exempt uid(s)", sugg.len());
+    }
 }
 
 /// The payload page handed to the kernel.  `get_user_pages_fast()` works on
