@@ -34,6 +34,10 @@ const O_NONBLOCK: c_int = 0o4000;
 const MOUNT_DEADLINE: Duration = Duration::from_secs(30);
 const REFRESH_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Set from the command line when the binary had to be run from a tmpfs copy:
+/// the state files and the .ko lookup then point at the real module tree.
+static LKM_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Exit code meaning "the native library could not be loaded", which tells the
 /// caller to fall back to an in-process call instead of treating it as a
 /// mount failure.
@@ -65,6 +69,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let action = args.get(1).map(String::as_str).unwrap_or("load");
 
+    // Set when the binary had to be copied to tmpfs to become executable: its
+    // own directory is then /dev, not the module tree.
+    if let Ok(dir) = std::env::var("MM_LKM_DIR") {
+        if Path::new(&dir).is_dir() {
+            let _ = LKM_DIR_OVERRIDE.set(PathBuf::from(dir));
+        }
+    }
+
     match action {
         "load" => load(),
         "mount" => supervise("__mount", args.get(2).map(String::as_str).unwrap_or("APatch"), MOUNT_DEADLINE),
@@ -83,10 +95,28 @@ fn main() {
 // ---------------------------------------------------------------- paths
 
 fn lkm_dir() -> PathBuf {
+    if let Some(dir) = LKM_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("/data/adb/modules/magic_mount/lkm"))
+}
+
+/// Where the .ko files may live.  A metamodule is installed twice - once under
+/// /data/adb/modules/<id> for the manager and once under /data/adb/metamodule -
+/// and the two copies are not always populated the same way, so a .ko missing
+/// from one tree is still usable from the other.
+fn scan_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        lkm_dir(),
+        PathBuf::from("/data/adb/metamodule/lkm"),
+        PathBuf::from("/data/adb/modules/magic_mount/lkm"),
+    ];
+    dirs.dedup();
+    dirs.retain(|d| d.is_dir());
+    dirs
 }
 
 fn module_dir() -> PathBuf {
@@ -206,16 +236,24 @@ fn candidates() -> Vec<PathBuf> {
         names.extend(family(version).iter().map(|s| s.to_string()));
     }
 
-    let dir = lkm_dir();
-    let shipped: Vec<String> = fs::read_dir(&dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("magic_hide") && n.ends_with(".ko"))
-                .collect()
-        })
-        .unwrap_or_default();
+    let dirs = scan_dirs();
+    let mut shipped: Vec<String> = Vec::new();
+    for dir in &dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for name in entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+        {
+            if name.starts_with("magic_hide")
+                && name.ends_with(".ko")
+                && !shipped.contains(&name)
+            {
+                shipped.push(name);
+            }
+        }
+    }
 
     if let Some(version) = &version {
         // Anything built for the same kernel line is still worth a try.
@@ -230,10 +268,16 @@ fn candidates() -> Vec<PathBuf> {
 
     let mut out: Vec<PathBuf> = Vec::new();
     for name in names {
-        let path = dir.join(format!("magic_hide-{name}.ko"));
-        let path = if path.exists() { path } else { dir.join(format!("{name}.ko")) };
-        if path.exists() && !out.contains(&path) {
-            out.push(path);
+        for dir in &dirs {
+            for candidate in [format!("magic_hide-{name}.ko"), format!("{name}.ko")] {
+                let path = dir.join(candidate);
+                if path.exists() && !out.contains(&path) {
+                    out.push(path);
+                }
+            }
+        }
+        if !out.is_empty() {
+            break;
         }
     }
     out
@@ -738,6 +782,20 @@ fn load() {
     let list = candidates();
     if list.is_empty() {
         println!("magic_hide: no .ko built for {}", release());
+        for dir in scan_dirs() {
+            let count = fs::read_dir(&dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".ko"))
+                        .count()
+                })
+                .unwrap_or(0);
+            println!("  scanned: {} ({count} .ko)", dir.display());
+        }
+        if scan_dirs().is_empty() {
+            println!("  scanned: no lkm directory exists");
+        }
         return;
     }
 
@@ -892,17 +950,25 @@ fn status() {
         if tried.is_empty() { "none".to_string() } else { tried.join(" -> ") }
     );
 
-    let mut shipped: Vec<String> = fs::read_dir(lkm_dir())
-        .map(|entries| {
-            entries
+    let mut shipped: Vec<String> = Vec::new();
+    for dir in scan_dirs() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for name in entries
                 .filter_map(|e| e.ok())
                 .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("magic_hide") && n.ends_with(".ko"))
-                .collect()
-        })
-        .unwrap_or_default();
+            {
+                if name.starts_with("magic_hide") && name.ends_with(".ko") && !shipped.contains(&name)
+                {
+                    shipped.push(name);
+                }
+            }
+        }
+    }
     shipped.sort();
     println!("shipped:  {}", if shipped.is_empty() { "none".to_string() } else { shipped.join(" ") });
+    for dir in scan_dirs() {
+        println!("scan:     {}", dir.display());
+    }
 
     let stats = fs::read_to_string(stats_file()).unwrap_or_default();
     match stats.lines().next() {

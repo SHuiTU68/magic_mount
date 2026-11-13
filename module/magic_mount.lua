@@ -52,38 +52,58 @@ end
 
 -- The package is built from the repository and shipped as a zip: the exec bit
 -- on lkm/loader does not survive every download path, and some devices mount
--- /data noexec.  Fix the mode first, then run a copy from tmpfs.
-local function loader_path()
-    local bin = moddir() .. "/lkm/loader"
-    if run(("test -x '%s'"):format(bin)) then
-        return bin
+-- /data noexec.  A ROM that installs the metamodule under /data/adb/metamodule
+-- also keeps a second copy under /data/adb/modules, and only one of the two is
+-- guaranteed to be complete, so both are candidates.
+local OTHER_ROOT = "/data/adb/metamodule"
+
+local function roots()
+    local out = { moddir() }
+    if OTHER_ROOT ~= moddir() then
+        out[#out + 1] = OTHER_ROOT
     end
-    run(("chmod 0755 '%s' 2>/dev/null"):format(bin))
-    if run(("test -x '%s'"):format(bin)) then
-        return bin
+    return out
+end
+
+local function first_loader()
+    for _, dir in ipairs(roots()) do
+        local bin = dir .. "/lkm/loader"
+        if run(("test -f '%s'"):format(bin)) == 0 then
+            return bin, dir .. "/lkm"
+        end
     end
     return nil
 end
 
 local function loader(action, log_file)
-    local bin = loader_path()
+    local bin, lkdir = first_loader()
     if not bin then
         return nil
     end
+    -- Note that a failed command still returns a number: 1 is true in Lua, so
+    -- every check here compares against 0 explicitly.
+    if run(("test -x '%s'"):format(bin)) ~= 0 then
+        run(("chmod 0755 '%s' 2>/dev/null"):format(bin))
+    end
+
     local redirect = ""
     if log_file then
         -- Append: post_fs_data and post_mount both report, and the failure of
         -- the first attempt is the interesting one.
         redirect = (" >>'%s' 2>&1"):format(log_file)
     end
-    local code = run(("'%s' %s%s"):format(bin, action, redirect))
-    if code == 126 then
+    local env = ("MM_LKM_DIR='%s' "):format(lkdir)
+    local code = run(("%s'%s' %s%s"):format(env, bin, action, redirect))
+
+    -- 127 is what sh returns when it cannot exec the file at all; 126 is a
+    -- file that exists but may not be executed.  Both are fixed the same way.
+    if code == 126 or code == 127 or code == nil then
         local tmp = "/dev/.mm_loader"
-        if run(("cp -f '%s' %s 2>/dev/null && chmod 0755 %s"):format(bin, tmp, tmp)) then
-            code = run(("'%s' %s%s"):format(tmp, action, redirect))
+        if run(("cp -f '%s' %s 2>/dev/null && chmod 0755 %s"):format(bin, tmp, tmp)) == 0 then
+            code = run(("%s'%s' %s%s"):format(env, tmp, action, redirect))
         end
     end
-    if code == 126 or code == 127 then
+    if code == 126 or code == 127 or code == nil then
         return nil
     end
     return code
