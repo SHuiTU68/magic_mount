@@ -29,6 +29,15 @@ ok()   { PASS=$((PASS + 1)); printf '  [PASS] %s\n' "$*"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  [FAIL] %s\n' "$*"; }
 skip() { SKIP=$((SKIP + 1)); printf '  [SKIP] %s\n' "$*"; }
 info() { INFO=$((INFO + 1)); printf '  [INFO] %s\n' "$*"; }
+
+# A metamodule is installed under /data/adb/metamodule, a normal one under
+# /data/adb/modules/<id>; the state files follow whichever exists.
+mmdir() {
+    for d in /data/adb/metamodule /data/adb/modules/magic_mount; do
+        [ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+    done
+    return 1
+}
 sec()  { printf '\n== %s ==\n' "$*"; }
 
 usage() {
@@ -264,7 +273,7 @@ check_identity() {
 check_timing() {
     sec "timing (mount stage timer)"
 
-    f=/data/adb/modules/magic_mount/mount-stats.txt
+    f=$(mmdir)/mount-stats.txt
     if [ ! -r "$f" ]; then
         skip "no stage timing yet (reboot once after installing this build)"
         return
@@ -272,6 +281,32 @@ check_timing() {
     while IFS= read -r line; do
         printf '      %s\n' "$line"
     done <"$f"
+}
+
+# Who asked for stat/statfs during boot.  The kernel records uid/pid/op/comm
+# only for the boot window, then drops the probes, so this is a frozen snapshot
+# rather than a live feed.
+check_observers() {
+    sec "observers (callers seen during boot)"
+
+    f=$(mmdir)/hide-events.log
+    if [ ! -r "$f" ]; then
+        skip "no observer log (older build, or the observer never armed)"
+        return
+    fi
+    sed -n '2,4p' "$f" | while IFS= read -r line; do printf '      %s\n' "$line"; done
+    n=0
+    while read -r uid pid op cnt comm; do
+        case "$uid" in ''|'#'*) continue ;; esac
+        n=$((n + 1))
+        [ "$n" -le 8 ] || continue
+        printf '      uid=%-6s pid=%-6s %-11s %8s  %s\n' "$uid" "$pid" "$op" "$cnt" "$comm"
+    done <"$f"
+    if [ "$n" -eq 0 ]; then
+        skip "the observer table is empty"
+    else
+        info "$n distinct callers recorded"
+    fi
 }
 
 check_readonly() {
@@ -357,6 +392,7 @@ check_hide
 check_mount_table
 check_identity
 check_timing
+check_observers
 check_readonly
 check_cleanup
 
