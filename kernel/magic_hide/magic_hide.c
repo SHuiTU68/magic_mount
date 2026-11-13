@@ -350,6 +350,8 @@ module_param_named(addr_newfstatat, g_ft_ip[1], ulong, 0);
 module_param_named(addr_statfs, g_ft_ip[2], ulong, 0);
 module_param_named(addr_fstatfs, g_ft_ip[3], ulong, 0);
 
+
+
 struct mh_ev_slot {
 	u32 uid;
 	u32 pid;
@@ -457,6 +459,36 @@ static void mh_ft_unregister(void)
 	g_ft_armed = false;
 }
 
+/*
+ * Addresses normally arrive as module parameters, but a load through a wrapper
+ * that drops the argument string leaves them zero and the observer silently
+ * dead.  Userspace already knows the values (it read kallsyms), so it can hand
+ * them over the key channel at any time instead.
+ */
+static int mh_set_addrs(const mh_u64 *in, mh_u32 n)
+{
+	mh_u64 ips[4] = { 0 };
+	u32 i;
+
+	if (n < 1 || n > 4)
+		return -EINVAL;
+	for (i = 0; i < n; i++)
+		ips[i] = in[i];
+
+	if (g_ft_armed) {
+		unregister_ftrace_function(&g_ft_ops);
+		g_ft_armed = false;
+	}
+	if (g_ft_filtered) {
+		ftrace_set_filter(&g_ft_ops, NULL, 0, 1);
+		g_ft_filtered = false;
+	}
+	for (i = 0; i < 4; i++)
+		g_ft_ip[i] = (unsigned long)ips[i];
+
+	return (g_ft_ip[0] || g_ft_ip[1] || g_ft_ip[2] || g_ft_ip[3]) ? 0 : -EINVAL;
+}
+
 static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 {
 	struct mh_uevent *out = (struct mh_uevent *)pl->buf;
@@ -495,7 +527,8 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 	 */
 	pl->hdr.mode = (g_ft_armed ? 1u : 0u) | (g_ft_filtered ? 2u : 0u) |
 		       (mh_ft_have_params() ? 4u : 0u) | (on ? 8u : 0u) |
-		       (atomic_read(&g_ft_matched) ? 16u : 0u);
+		       (atomic_read(&g_ft_matched) ? 16u : 0u) |
+		       (MH_HAVE_FTRACE ? 32u : 0u);
 	pl->hdr.reserved = (u32)atomic_read(&g_ft_calls);
 	return n;
 }
@@ -514,6 +547,13 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 
 static void mh_ft_unregister(void)
 {
+}
+
+static int mh_set_addrs(const mh_u64 *in, mh_u32 n)
+{
+	(void)in;
+	(void)n;
+	return -EOPNOTSUPP;
 }
 
 static bool mh_ft_have_params(void)
@@ -1548,6 +1588,14 @@ static int mh_process_payload(unsigned long user_addr)
 		mutex_lock(&g_mutex);
 		ret = mh_set_exempt((const u32 *)pl->buf, pl->hdr.count);
 		mutex_unlock(&g_mutex);
+		break;
+	case MH_CMD_CONFIG:
+		if (pl->hdr.count < 1 || pl->hdr.count > 4 ||
+		    pl->hdr.data_size < pl->hdr.count * (u32)sizeof(mh_u64)) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = mh_set_addrs((const mh_u64 *)pl->buf, pl->hdr.count);
 		break;
 	case MH_CMD_EVENTS:
 		pl->hdr.count = mh_events_dump(pl, pl->hdr.mode != 0);

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MH_PAGE_SIZE: usize = 4096;
 const MH_PAYLOAD_MAGIC: u32 = 0x4d48_5359; // "MHSY"
-const MH_PAYLOAD_VERSION: u32 = 4; // 4: POLICY + EVENTS
+const MH_PAYLOAD_VERSION: u32 = 5; // 5: CONFIG (ftrace addresses)
 const MH_PATH_MAX: usize = 512;
 const MH_BUF_MAX: usize = MH_PAGE_SIZE - std::mem::size_of::<Uhdr>();
 
@@ -41,6 +41,7 @@ const MH_CMD_MODE: u32 = 2;
 const MH_CMD_REFRESH: u32 = 4;
 const MH_CMD_POLICY: u32 = 5;
 const MH_CMD_EVENTS: u32 = 6;
+const MH_CMD_CONFIG: u32 = 7;
 
 const MH_MODE_ALL: u32 = 1;
 
@@ -458,8 +459,45 @@ pub struct Observed {
     pub flags: u32,
     /// Number of callbacks entered; 0 means the ftrace op never ran.
     pub calls: u32,
+    /// True when the LKM was built with the ftrace observer at all.
+    pub ftrace_build: bool,
+    /// True when the four addresses were accepted through MH_CMD_CONFIG.
+    pub addrs: bool,
     /// False when the LKM refused the command (not loaded, version mismatch).
     pub reached: bool,
+}
+
+/// The addresses the loader resolved from kallsyms, written next to the module.
+/// Parameter passing through init_module() is not reliable on every kernel, so
+/// they are also delivered over the key channel before observing starts.
+fn read_addrs() -> Option<[u64; 4]> {
+    let text = std::fs::read_to_string(crate::moddir::path().join("ftrace-addrs")).ok()?;
+    let mut out = [0u64; 4];
+    let mut n = 0;
+    for line in text.lines() {
+        let Some(value) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        if n == 4 {
+            break;
+        }
+        out[n] = u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()?;
+        n += 1;
+    }
+    (n == 4).then_some(out)
+}
+
+fn configure_addrs(addrs: &[u64; 4]) -> bool {
+    let Some(mut payload) = Payload::new() else {
+        return false;
+    };
+    {
+        let buf = payload.buf_mut();
+        for (i, addr) in addrs.iter().enumerate() {
+            buf[i * 8..i * 8 + 8].copy_from_slice(&addr.to_le_bytes());
+        }
+    }
+    payload.send(MH_CMD_CONFIG, 4, 32)
 }
 
 /// Turn the caller observer on or off and return (and clear) what it collected.
@@ -471,8 +509,13 @@ pub fn observe_full(on: bool) -> Observed {
         events: Vec::new(),
         flags: 0,
         calls: 0,
+        ftrace_build: false,
+        addrs: false,
         reached: false,
     };
+    if on {
+        out.addrs = read_addrs().is_some_and(|addrs| configure_addrs(&addrs));
+    }
     let Some(mut payload) = Payload::new() else {
         return out;
     };
@@ -482,6 +525,7 @@ pub fn observe_full(on: bool) -> Observed {
     out.reached = true;
     out.flags = payload.hdr().mode;
     out.calls = payload.hdr().reserved;
+    out.ftrace_build = out.flags & 32 != 0;
 
     let count = (payload.hdr().count as usize).min(MH_EV_MAX);
     let buf = payload.buf_mut();
@@ -526,7 +570,10 @@ pub fn report() -> bool {
         policy = set_exempt(&uids);
     }
 
-    let seen = observe_full(false);
+    // Arm once more so the status bits describe a registered probe, take the
+    // drain, then tear the trampoline down for good.
+    let seen = observe_full(true);
+    let _ = observe_full(false);
     let mut log = String::from("# magic_hide observers: uid pid op count comm\n");
     log.push_str(&format!(
         "# ko: {}\n",
@@ -540,8 +587,9 @@ pub fn report() -> bool {
         log.push_str("# state: unavailable (the LKM did not answer MH_CMD_EVENTS)\n");
     } else {
         log.push_str(&format!(
-            "# state: params={} armed={} filtered={} matched={} calls={} events={}\n",
-            seen.flags & 4 != 0,
+            "# state: ftrace_build={} addrs={} armed={} filtered={} matched={} calls={} events={}\n",
+            seen.ftrace_build,
+            seen.addrs,
             seen.flags & 1 != 0,
             seen.flags & 2 != 0,
             seen.flags & 16 != 0,

@@ -30,7 +30,7 @@ typedef int32_t  mh_s32;
 
 #define MH_PAGE_SIZE        4096u
 #define MH_PAYLOAD_MAGIC    0x4d485359u /* "MHSY" */
-#define MH_PAYLOAD_VERSION  4u /* 4: POLICY + EVENTS (process-level) */
+#define MH_PAYLOAD_VERSION  5u /* 5: CONFIG (ftrace addresses) */
 #define MH_PATH_MAX         512
 
 /* Key type used by the LKM; add_key() is cancelled right after it runs. */
@@ -45,6 +45,7 @@ enum mh_cmd {
 	MH_CMD_REFRESH = 4, /* re-resolve paths, keep the published identity */
 	MH_CMD_POLICY = 5, /* replace the exempt uid set (process-level)     */
 	MH_CMD_EVENTS = 6, /* dump observed syscall callers, then clear      */
+	MH_CMD_CONFIG = 7, /* deliver the four ftrace addresses (u64[])      */
 };
 
 enum mh_mode {

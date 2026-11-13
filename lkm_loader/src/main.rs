@@ -545,20 +545,37 @@ impl Kmsg {
     }
 }
 
+const FTRACE_NEED: [(&str, &str); 4] = [
+    ("addr_statx", "__arm64_sys_statx"),
+    ("addr_newfstatat", "__arm64_sys_newfstatat"),
+    ("addr_statfs", "__arm64_sys_statfs"),
+    ("addr_fstatfs", "__arm64_sys_fstatfs"),
+];
+
 fn ftrace_params(syms: &std::collections::HashMap<String, u64>) -> String {
-    const NEED: [(&str, &str); 4] = [
-        ("addr_statx", "__arm64_sys_statx"),
-        ("addr_newfstatat", "__arm64_sys_newfstatat"),
-        ("addr_statfs", "__arm64_sys_statfs"),
-        ("addr_fstatfs", "__arm64_sys_fstatfs"),
-    ];
     let mut out: Vec<String> = Vec::new();
-    for (param, name) in NEED {
+    for (param, name) in FTRACE_NEED {
         if let Some(addr) = syms.get(name) {
             out.push(format!("{param}=0x{addr:x}"));
         }
     }
     out.join(" ")
+}
+
+/// The module parameters are the first attempt, but a load through a wrapper
+/// that drops the argument string leaves the LKM with zeros.  Write the same
+/// addresses next to the module so the mount library can deliver them over the
+/// key channel before it starts observing.
+fn save_addrs(syms: &std::collections::HashMap<String, u64>) {
+    let mut text = String::new();
+    for (param, name) in FTRACE_NEED {
+        if let Some(addr) = syms.get(name) {
+            text.push_str(&format!("{param} 0x{addr:x}\n"));
+        }
+    }
+    if text.lines().count() == 4 {
+        let _ = fs::write(module_dir().join("ftrace-addrs"), text);
+    }
 }
 
 fn init_module_call(buf: &[u8], len: usize, params: &CString) -> c_long {
@@ -608,6 +625,7 @@ fn insert(path: &Path) -> Result<(), String> {
     for _ in 0..5 {
         let rc = init_module_call(&image, len, &cparams);
         if rc == 0 {
+            save_addrs(&syms);
             report_params(&params, resolved, undef);
             return Ok(());
         }
@@ -617,6 +635,7 @@ fn insert(path: &Path) -> Result<(), String> {
         // the fd based variant, which is also what insmod uses.
         if last_err == 38 || last_err == 1 || last_err == 13 {
             if finit_module_call(&image, len, &cparams) == 0 {
+                save_addrs(&syms);
                 report_params(&params, resolved, undef);
                 return Ok(());
             }
