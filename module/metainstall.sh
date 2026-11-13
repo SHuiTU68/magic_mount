@@ -52,6 +52,42 @@ else
 	say "! no lkm/ in this package: mounts will not be hidden"
 fi
 
+# Remove everything the previous version installed that this zip does not
+# ship: a .ko for a KMI that is no longer built, a script that was dropped, an
+# old libmagic_mount.so.  Managers disagree on whether they wipe the module
+# directory before copying, so the package's own file list is the source of
+# truth.  Only files are removed; the manager's state flags survive.
+clean_old_files() {
+	target="$1"
+	list="$MODPATH/files.list"
+
+	[ -f "$list" ] || return 0
+	[ -d "$target" ] || return 0
+	# Never touch a directory that is not ours, whatever MODID says.
+	[ -f "$target/module.prop" ] || return 0
+	grep -qx 'id=magic_mount' "$target/module.prop" || return 0
+
+	find "$target" -type f | while IFS= read -r path; do
+		rel=${path#"$target"/}
+		case "$rel" in
+		files.list | module.prop | mount-stats.txt | disable | remove | skip_mount | update)
+			continue
+			;;
+		esac
+		grep -qxF "$rel" "$list" && continue
+		rm -f "$path"
+	done
+
+	# Drop the now-empty directories too, or an old lkm/ layout would remain
+	# visible in the installed module.
+	find "$target" -mindepth 1 -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+	return 0
+}
+
+if [ -n "$MODPATH" ] && [ -d "$MODPATH" ]; then
+	clean_old_files "${NVBASE:-/data/adb}/modules/${MODID:-magic_mount}"
+fi
+
 # Must stay last: install_module copies $MODPATH to /data, so anything created
 # above (the partition links in particular) is only packaged if it runs after.
 install_module

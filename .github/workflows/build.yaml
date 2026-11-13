@@ -59,7 +59,11 @@ jobs:
           upx --best --lzma --android-shlib build/libmagic_mount.so
           cp module/* build/
           cp lkm/*.ko build/lkm/
-          ls -lh build build/lkm
+          # The install script deletes files the previous version left behind
+          # by diffing the installed tree against this list, so it has to be
+          # generated last, from the exact payload that ships.
+          (cd build && find . -type f ! -name files.list | sed 's|^\./||' | sort > files.list)
+          ls -lh build build/lkm && cat build/files.list
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v5
