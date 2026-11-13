@@ -466,10 +466,31 @@ fn run_native(symbol: &str, arg: &str) {
 }
 
 fn status() {
-    println!("kernel:   {}", release());
+    let rel = release();
+    let (tag, version) = release_info(&rel);
+    println!("kernel:   {rel}");
+    println!(
+        "kmi:      {}",
+        match (&tag, &version) {
+            (Some(tag), Some(version)) => format!("{tag}-{version}"),
+            (None, Some(version)) => format!("unknown-{version}"),
+            _ => "unknown".to_string(),
+        }
+    );
+    println!("platform: {}", property("ro.build.version.release"));
     println!("arch:     {}", std::env::consts::ARCH);
     println!("state:    {}", if loaded() { "loaded" } else { "not loaded" });
+    println!("dir:      {}", module_dir().display());
     println!("failures: {}", read_count(&failures_file()));
+
+    let tried: Vec<String> = candidates()
+        .iter()
+        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .collect();
+    println!(
+        "try:      {}",
+        if tried.is_empty() { "none".to_string() } else { tried.join(" -> ") }
+    );
 
     let mut shipped: Vec<String> = fs::read_dir(lkm_dir())
         .map(|entries| {

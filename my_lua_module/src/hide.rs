@@ -528,8 +528,16 @@ pub fn report() -> bool {
 
     let seen = observe_full(false);
     let mut log = String::from("# magic_hide observers: uid pid op count comm\n");
+    log.push_str(&format!(
+        "# ko: {}\n",
+        if Path::new("/sys/module/magic_hide").exists() {
+            "loaded"
+        } else {
+            "not loaded"
+        }
+    ));
     if !seen.reached {
-        log.push_str("# state: unavailable (magic_hide not loaded, or payload version mismatch)\n");
+        log.push_str("# state: unavailable (the LKM did not answer MH_CMD_EVENTS)\n");
     } else {
         log.push_str(&format!(
             "# state: params={} armed={} filtered={} matched={} calls={} events={}\n",
@@ -540,6 +548,13 @@ pub fn report() -> bool {
             seen.calls,
             seen.events.len(),
         ));
+    }
+    // The loader writes why an insert failed; without it the log only says
+    // "not loaded" and the reason stays in a terminal nobody reads.
+    if let Ok(text) = std::fs::read_to_string(dir.join("lkm.log")) {
+        for line in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
+            log.push_str(&format!("# lkm: {line}\n"));
+        }
     }
     let mut sorted = seen.events;
     sorted.sort_by(|a, b| b.count.cmp(&a.count));

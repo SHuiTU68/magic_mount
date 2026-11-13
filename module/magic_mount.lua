@@ -65,16 +65,22 @@ local function loader_path()
     return nil
 end
 
-local function loader(action)
+local function loader(action, log_file)
     local bin = loader_path()
     if not bin then
         return nil
     end
-    local code = run(("'%s' %s"):format(bin, action))
+    local redirect = ""
+    if log_file then
+        -- Append: post_fs_data and post_mount both report, and the failure of
+        -- the first attempt is the interesting one.
+        redirect = (" >>'%s' 2>&1"):format(log_file)
+    end
+    local code = run(("'%s' %s%s"):format(bin, action, redirect))
     if code == 126 then
         local tmp = "/dev/.mm_loader"
         if run(("cp -f '%s' %s 2>/dev/null && chmod 0755 %s"):format(bin, tmp, tmp)) then
-            code = run(("'%s' %s"):format(tmp, action))
+            code = run(("'%s' %s%s"):format(tmp, action, redirect))
         end
     end
     if code == 126 or code == 127 then
@@ -138,14 +144,14 @@ end
 
 function M.post_fs_data(superkey)
     log("post_fs_data called")
-    loader("load")
+    loader("load", moddir() .. "/lkm.log")
 end
 
 function M.post_mount(superkey)
     log("post_mount called")
     -- Safety net for root managers that skip post_fs_data; the loader exits
     -- immediately when the module is already loaded.
-    loader("load")
+    loader("load", moddir() .. "/lkm.log")
 
     local source = (superkey == "kernelsu") and "KSU" or "APatch"
     local code = loader("mount " .. source)
