@@ -603,6 +603,14 @@ fn finit_module_call(buf: &[u8], len: usize, params: &CString) -> c_long {
     unsafe { syscall(SYS_FINIT_MODULE, fd as c_long, params.as_ptr() as c_long, 0 as c_long) }
 }
 
+fn modinfo_str(buf: &[u8], key: &str) -> Option<String> {
+    let needle = key.as_bytes();
+    let pos = buf.windows(needle.len()).position(|w| w == needle)?;
+    let rest = &buf[pos + needle.len()..];
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(0);
+    Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+}
+
 fn insert(path: &Path) -> Result<(), String> {
     let syms = kallsyms();
     let params = ftrace_params(&syms);
@@ -611,6 +619,9 @@ fn insert(path: &Path) -> Result<(), String> {
     let mut image = fs::read(path).map_err(|e| e.to_string())?;
     if image.len() < 64 || &image[..4] != b"\x7fELF" {
         return Err("not an ELF64 module".into());
+    }
+    if let Some(cfg) = modinfo_str(&image, "mh_ftrace_cfg=") {
+        println!("  build cfg: {cfg}");
     }
     let (resolved, undef) = resolve_undef(&mut image, &syms);
     let mut len = image.len();

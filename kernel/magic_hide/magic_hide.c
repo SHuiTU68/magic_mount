@@ -340,9 +340,20 @@ static bool mh_hide_for_current(void)
  * MH_CMD_POLICY, so the exemption list is decided in userspace with the actual
  * process list in hand, not guessed inside the kernel.
  */
-#if IS_ENABLED(CONFIG_FUNCTION_TRACER) && IS_ENABLED(CONFIG_DYNAMIC_FTRACE)
+/*
+ * Only CONFIG_DYNAMIC_FTRACE gates this block.  The previous gate also required
+ * CONFIG_FUNCTION_TRACER, which some DDK header snapshots leave undefined even
+ * though the kernel ships the whole subsystem -- that compiled the observer out
+ * and left the LKM silently blind.  MH_FTRACE_CFG is reported through modinfo
+ * so the build-time decision can be read back from the artifact.
+ */
+#define MH_HAVE_FTRACE IS_ENABLED(CONFIG_DYNAMIC_FTRACE)
 
-#define MH_HAVE_FTRACE 1
+MODULE_INFO(mh_ftrace_cfg,
+	    "dft=" __stringify(IS_ENABLED(CONFIG_DYNAMIC_FTRACE))
+	    " ft=" __stringify(IS_ENABLED(CONFIG_FUNCTION_TRACER)));
+
+#if MH_HAVE_FTRACE
 
 static unsigned long g_ft_ip[4];
 module_param_named(addr_statx, g_ft_ip[0], ulong, 0);
@@ -397,16 +408,12 @@ static void mh_ft_hit(unsigned long ip)
 	atomic_inc(&s->count);
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 static void mh_ft_cb(unsigned long ip, unsigned long parent_ip,
-		     struct ftrace_ops *ops, struct ftrace_regs *fregs)
-#else
-static void mh_ft_cb(unsigned long ip, unsigned long parent_ip,
-		     struct ftrace_ops *ops, struct pt_regs *regs)
-#endif
+		     struct ftrace_ops *ops, void *ctx)
 {
 	(void)parent_ip;
 	(void)ops;
+	(void)ctx;
 	if (!atomic_read(&g_ev_on))
 		return;
 	atomic_inc(&g_ft_calls);
@@ -414,7 +421,7 @@ static void mh_ft_cb(unsigned long ip, unsigned long parent_ip,
 }
 
 static struct ftrace_ops g_ft_ops = {
-	.func = mh_ft_cb,
+	.func = (ftrace_func_t)mh_ft_cb,
 	.flags = FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_DYNAMIC,
 };
 
@@ -520,10 +527,10 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 
 	/*
 	 * Diagnostics for the module: bit0 armed, bit1 filter installed, bit2
-	 * parameters received, bit3 this call was the enabling one, bit4 at
-	 * least one callback matched an address.  reserved carries the number
-	 * of callbacks entered, which separates "never called" from "called
-	 * with unexpected ip".
+	 * addresses received, bit3 this call was the enabling one, bit4 at least
+	 * one callback matched an address, bit5 the ftrace API exists here.
+	 * reserved carries the number of callbacks entered, which separates
+	 * "never called" from "called with unexpected ip".
 	 */
 	pl->hdr.mode = (g_ft_armed ? 1u : 0u) | (g_ft_filtered ? 2u : 0u) |
 		       (mh_ft_have_params() ? 4u : 0u) | (on ? 8u : 0u) |
@@ -533,14 +540,12 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 	return n;
 }
 
-#else /* no dynamic ftrace in this kernel */
-
-#define MH_HAVE_FTRACE 0
+#else /* CONFIG_DYNAMIC_FTRACE not visible to this build */
 
 static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 {
 	(void)on;
-	pl->hdr.mode = 0; /* no ftrace in this build */
+	pl->hdr.mode = 0; /* observer not compiled in */
 	pl->hdr.reserved = 0;
 	return 0;
 }
@@ -561,7 +566,7 @@ static bool mh_ft_have_params(void)
 	return false;
 }
 
-#endif /* CONFIG_FUNCTION_TRACER && CONFIG_DYNAMIC_FTRACE */
+#endif /* MH_HAVE_FTRACE */
 
 /* ------------------------------------------------------------------ */
 /* anchor table                                                        */
