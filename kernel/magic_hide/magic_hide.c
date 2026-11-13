@@ -12,7 +12,17 @@
  *   3. stat()/statx()/fstat() report the tmpfs or module filesystem st_dev and
  *      f2fs inode numbers on entries the skeleton owns;
  *   4. the module and its probes are listed in /proc/modules and
- *      /sys/kernel/debug/kprobes/list.
+ *      /sys/kernel/debug/kprobes/list;
+ *   5. every caller gets the same answer, including a process that still has
+ *      to use the real partition.
+ *
+ * Point 5 is handled outside the kretprobes: an ftrace op on the stat syscall
+ * wrappers only records *who* asked (uid/pid/comm, gated by one atomic read
+ * while the window is open), the module drains that table and answers with an
+ * exempt-uid set that the visibility checks consult.  A kprobe cannot share a
+ * function with an ftrace op on arm64, and deciding a per-process policy inside
+ * the hot kretprobe would put a second policy lookup on every stat() in the
+ * system; this keeps the hot path as it was.
  *
  * Points 1-3 are handled by filtering / rewriting the *completed* result, so
  * every hook is a kretprobe: a plain kprobe post_handler runs right after the
@@ -350,6 +360,7 @@ struct mh_ev_slot {
 
 static struct mh_ev_slot g_ev[MH_EV_MAX];
 static atomic_t g_ev_on = ATOMIC_INIT(0);
+static bool g_ft_filtered;
 static bool g_ft_armed;
 
 static void mh_ft_hit(unsigned long ip)
@@ -404,16 +415,19 @@ static void mh_ft_register(void)
 
 	if (g_ft_armed)
 		return;
-	for (i = 0; i < 4; i++) {
-		if (!g_ft_ip[i])
-			continue;
-		if (ftrace_set_filter_ip(&g_ft_ops, g_ft_ip[i], 0, 0))
-			pr_debug("cannot filter syscall %d\n", i);
-		else
-			armed++;
+	if (!g_ft_filtered) {
+		for (i = 0; i < 4; i++) {
+			if (!g_ft_ip[i])
+				continue;
+			if (ftrace_set_filter_ip(&g_ft_ops, g_ft_ip[i], 0, 0))
+				pr_debug("cannot filter syscall %d\n", i);
+			else
+				armed++;
+		}
+		if (!armed)
+			return;
+		g_ft_filtered = true;
 	}
-	if (!armed)
-		return;
 	if (register_ftrace_function(&g_ft_ops)) {
 		pr_debug("cannot register ftrace observer\n");
 		return;
@@ -421,13 +435,14 @@ static void mh_ft_register(void)
 	g_ft_armed = true;
 }
 
+/* Leaves no trampoline behind once the boot window is over. */
 static void mh_ft_unregister(void)
 {
+	atomic_set(&g_ev_on, 0);
 	if (!g_ft_armed)
 		return;
 	unregister_ftrace_function(&g_ft_ops);
 	g_ft_armed = false;
-	atomic_set(&g_ev_on, 0);
 }
 
 static u32 mh_events_dump(struct mh_upayload *pl, bool on)
@@ -435,9 +450,12 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 	struct mh_uevent *out = (struct mh_uevent *)pl->buf;
 	u32 i, n = 0;
 
-	atomic_set(&g_ev_on, on ? 1 : 0);
-	if (on)
+	if (on) {
 		mh_ft_register();
+		atomic_set(&g_ev_on, 1);
+	} else {
+		mh_ft_unregister();
+	}
 
 	for (i = 0; i < MH_EV_MAX; i++) {
 		struct mh_ev_slot *s = &g_ev[i];
