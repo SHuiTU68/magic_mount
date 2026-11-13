@@ -341,13 +341,14 @@ static bool mh_hide_for_current(void)
  * process list in hand, not guessed inside the kernel.
  */
 /*
- * Only CONFIG_DYNAMIC_FTRACE gates this block.  The previous gate also required
- * CONFIG_FUNCTION_TRACER, which some DDK header snapshots leave undefined even
- * though the kernel ships the whole subsystem -- that compiled the observer out
- * and left the LKM silently blind.  MH_FTRACE_CFG is reported through modinfo
- * so the build-time decision can be read back from the artifact.
+ * The observer is compiled in unconditionally.  This DDK header snapshot
+ * defines neither CONFIG_DYNAMIC_FTRACE nor CONFIG_FUNCTION_TRACER (verified
+ * through the MODULE_INFO below), which used to compile the whole block out and
+ * leave the LKM silently blind on a kernel that does ship ftrace.  The loader
+ * resolves undefined symbols from kallsyms, so a kernel without the API simply
+ * fails the u64 address handshake and reports the observer as unavailable.
  */
-#define MH_HAVE_FTRACE IS_ENABLED(CONFIG_DYNAMIC_FTRACE)
+#define MH_HAVE_FTRACE 1
 
 MODULE_INFO(mh_ftrace_cfg,
 	    "dft=" __stringify(IS_ENABLED(CONFIG_DYNAMIC_FTRACE))
