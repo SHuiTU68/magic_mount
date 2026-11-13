@@ -280,16 +280,18 @@ fn ftrace_params() -> String {
 
 fn insert(path: &Path) -> Result<(), String> {
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let params = CString::new(ftrace_params()).map_err(|e| e.to_string())?;
+    let params = ftrace_params();
+    let cparams = CString::new(params.clone()).map_err(|e| e.to_string())?;
     let rc = unsafe {
         syscall(
             SYS_FINIT_MODULE,
             file.as_raw_fd() as c_long,
-            params.as_ptr() as c_long,
+            cparams.as_ptr() as c_long,
             0 as c_long,
         )
     };
     if rc == 0 {
+        report_params(&params);
         return Ok(());
     }
     let errno = std::io::Error::last_os_error();
@@ -298,15 +300,27 @@ fn insert(path: &Path) -> Result<(), String> {
     for insmod in ["/system/bin/insmod", "/vendor/bin/insmod", "insmod"] {
         let out = Command::new(insmod)
             .arg(path)
-            .args(ftrace_params().split_whitespace())
+            .args(params.split_whitespace())
             .output();
         if let Ok(out) = out {
             if out.status.success() {
+                report_params(&params);
                 return Ok(());
             }
         }
     }
     Err(errno.to_string())
+}
+
+/// The observer only works when all four addresses arrived; say so in the
+/// manager log instead of failing silently at the first MH_CMD_EVENTS.
+fn report_params(params: &str) {
+    let n = params.split_whitespace().count();
+    if n == 4 {
+        println!("  ftrace: 4/4 syscall addresses passed");
+    } else {
+        println!("  ftrace: {n}/4 syscall addresses (observer disabled)");
+    }
 }
 
 // ---------------------------------------------------------------- commands

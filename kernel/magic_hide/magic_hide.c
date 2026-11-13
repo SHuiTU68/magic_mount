@@ -360,6 +360,8 @@ struct mh_ev_slot {
 
 static struct mh_ev_slot g_ev[MH_EV_MAX];
 static atomic_t g_ev_on = ATOMIC_INIT(0);
+static atomic_t g_ft_calls = ATOMIC_INIT(0);
+static atomic_t g_ft_matched = ATOMIC_INIT(0);
 static bool g_ft_filtered;
 static bool g_ft_armed;
 
@@ -375,9 +377,13 @@ static void mh_ft_hit(unsigned long ip)
 	}
 	if (op == 4)
 		return;
+	atomic_set(&g_ft_matched, 1);
 
-	if (READ_ONCE(s->uid) != uid) {
-		WRITE_ONCE(s->uid, 0);
+	/*
+	 * uid 0 is a valid key, so "empty" is count == 0, not uid == 0.  A slot
+	 * cleared by a dump is re-initialised on its next hit.
+	 */
+	if (READ_ONCE(s->uid) != uid || !atomic_read(&s->count)) {
 		WRITE_ONCE(s->pid, 0);
 		atomic_set(&s->count, 0);
 		memset(s->comm, 0, sizeof(s->comm));
@@ -401,6 +407,7 @@ static void mh_ft_cb(unsigned long ip, unsigned long parent_ip,
 	(void)ops;
 	if (!atomic_read(&g_ev_on))
 		return;
+	atomic_inc(&g_ft_calls);
 	mh_ft_hit(ip);
 }
 
@@ -408,6 +415,11 @@ static struct ftrace_ops g_ft_ops = {
 	.func = mh_ft_cb,
 	.flags = FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_DYNAMIC,
 };
+
+static bool mh_ft_have_params(void)
+{
+	return g_ft_ip[0] || g_ft_ip[1] || g_ft_ip[2] || g_ft_ip[3];
+}
 
 static void mh_ft_register(void)
 {
@@ -451,6 +463,8 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 	u32 i, n = 0;
 
 	if (on) {
+		atomic_set(&g_ft_calls, 0);
+		atomic_set(&g_ft_matched, 0);
 		mh_ft_register();
 		atomic_set(&g_ev_on, 1);
 	} else {
@@ -461,7 +475,7 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 		struct mh_ev_slot *s = &g_ev[i];
 		int cnt = atomic_read(&s->count);
 
-		if (!cnt || !READ_ONCE(s->uid))
+		if (!cnt)
 			continue;
 		out[n].uid = READ_ONCE(s->uid);
 		out[n].pid = READ_ONCE(s->pid);
@@ -471,6 +485,18 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 		atomic_set(&s->count, 0);
 		n++;
 	}
+
+	/*
+	 * Diagnostics for the module: bit0 armed, bit1 filter installed, bit2
+	 * parameters received, bit3 this call was the enabling one, bit4 at
+	 * least one callback matched an address.  reserved carries the number
+	 * of callbacks entered, which separates "never called" from "called
+	 * with unexpected ip".
+	 */
+	pl->hdr.mode = (g_ft_armed ? 1u : 0u) | (g_ft_filtered ? 2u : 0u) |
+		       (mh_ft_have_params() ? 4u : 0u) | (on ? 8u : 0u) |
+		       (atomic_read(&g_ft_matched) ? 16u : 0u);
+	pl->hdr.reserved = (u32)atomic_read(&g_ft_calls);
 	return n;
 }
 
@@ -480,13 +506,19 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 
 static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 {
-	(void)pl;
 	(void)on;
+	pl->hdr.mode = 0; /* no ftrace in this build */
+	pl->hdr.reserved = 0;
 	return 0;
 }
 
 static void mh_ft_unregister(void)
 {
+}
+
+static bool mh_ft_have_params(void)
+{
+	return false;
 }
 
 #endif /* CONFIG_FUNCTION_TRACER && CONFIG_DYNAMIC_FTRACE */
@@ -1622,9 +1654,9 @@ static int __init magic_hide_init(void)
 		pr_err("no hook could be installed\n");
 		return -ENOENT;
 	}
-	pr_info("loaded: mountinfo=%d vfsmnt=%d vfsstat=%d modules=%d kprobes=%d mode=%d ftrace=%d\n",
+	pr_info("loaded: mountinfo=%d vfsmnt=%d vfsstat=%d modules=%d kprobes=%d mode=%d ftrace=%d params=%d\n",
 		g_reg_mountinfo, g_reg_vfsmnt, g_reg_vfsstat, g_reg_modules,
-		g_reg_kprobes, (int)g_mode, MH_HAVE_FTRACE);
+		g_reg_kprobes, (int)g_mode, MH_HAVE_FTRACE, mh_ft_have_params());
 	return 0;
 }
 

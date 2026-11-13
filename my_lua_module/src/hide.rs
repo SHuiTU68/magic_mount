@@ -450,20 +450,42 @@ pub fn set_exempt(uids: &[u32]) -> bool {
     )
 }
 
+/// Result of one MH_CMD_EVENTS round trip, including why it may be empty.
+pub struct Observed {
+    pub events: Vec<Observer>,
+    /// bit0 armed, bit1 filter installed, bit2 addresses received,
+    /// bit3 this call enabled observation, bit4 a callback matched.
+    pub flags: u32,
+    /// Number of callbacks entered; 0 means the ftrace op never ran.
+    pub calls: u32,
+    /// False when the LKM refused the command (not loaded, version mismatch).
+    pub reached: bool,
+}
+
 /// Turn the caller observer on or off and return (and clear) what it collected.
 ///
 /// Enabling is cheap in the kernel: the ftrace probe is already registered at
 /// load time, the switch is one atomic read per stat call while active.
-pub fn observe(on: bool) -> Vec<Observer> {
+pub fn observe_full(on: bool) -> Observed {
+    let mut out = Observed {
+        events: Vec::new(),
+        flags: 0,
+        calls: 0,
+        reached: false,
+    };
     let Some(mut payload) = Payload::new() else {
-        return Vec::new();
+        return out;
     };
     if !payload.send_mode(MH_CMD_EVENTS, u32::from(on), 0, 0) {
-        return Vec::new();
+        return out;
     }
+    out.reached = true;
+    out.flags = payload.hdr().mode;
+    out.calls = payload.hdr().reserved;
+
     let count = (payload.hdr().count as usize).min(MH_EV_MAX);
     let buf = payload.buf_mut();
-    (0..count)
+    out.events = (0..count)
         .map(|i| {
             // SAFETY: the kernel wrote `count` Uevent records at the start of
             // the buffer and Uevent is repr(C) with no padding.
@@ -479,7 +501,12 @@ pub fn observe(on: bool) -> Vec<Observer> {
                 comm: ev.comm,
             }
         })
-        .collect()
+        .collect();
+    out
+}
+
+pub fn observe(on: bool) -> Vec<Observer> {
+    observe_full(on).events
 }
 
 /// Module directory; the loader derives its own path the same way, but this
@@ -502,9 +529,22 @@ pub fn report() -> bool {
         policy = set_exempt(&uids);
     }
 
-    let observers = observe(false);
+    let seen = observe_full(false);
     let mut log = String::from("# magic_hide observers: uid pid op count comm\n");
-    let mut sorted = observers;
+    if !seen.reached {
+        log.push_str("# state: unavailable (magic_hide not loaded, or payload version mismatch)\n");
+    } else {
+        log.push_str(&format!(
+            "# state: params={} armed={} filtered={} matched={} calls={} events={}\n",
+            seen.flags & 4 != 0,
+            seen.flags & 1 != 0,
+            seen.flags & 2 != 0,
+            seen.flags & 16 != 0,
+            seen.calls,
+            seen.events.len(),
+        ));
+    }
+    let mut sorted = seen.events;
     sorted.sort_by(|a, b| b.count.cmp(&a.count));
     for o in &sorted {
         log.push_str(&format!(
