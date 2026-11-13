@@ -560,6 +560,7 @@ pub fn report() -> bool {
     let dir = crate::moddir::path();
     let dir = dir.as_path();
     let mut policy = false;
+    let mut exempt_n = 0usize;
 
     if let Ok(text) = std::fs::read_to_string(dir.join("hide-exempt-uids")) {
         let uids: Vec<u32> = text
@@ -567,6 +568,7 @@ pub fn report() -> bool {
             .filter_map(|line| line.split('#').next())
             .filter_map(|line| line.trim().parse().ok())
             .collect();
+        exempt_n = uids.len();
         policy = set_exempt(&uids);
     }
 
@@ -595,6 +597,11 @@ pub fn report() -> bool {
             seen.flags & 16 != 0,
             seen.calls,
             seen.events.len(),
+        ));
+        log.push_str(&format!(
+            "# policy: {} exempt uid(s){}\n",
+            exempt_n,
+            if policy { "" } else { " (not applied)" }
         ));
     }
     // The loader writes why an insert failed; without it the log only says

@@ -498,8 +498,16 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 	u32 i, n = 0;
 
 	if (on) {
-		atomic_set(&g_ft_calls, 0);
-		atomic_set(&g_ft_matched, 0);
+		/*
+		 * Only a fresh start clears the counters.  The report path re-enables
+		 * an observer that has been collecting since post_mount, and wiping
+		 * the totals there made "calls=0" look like the probes never fired
+		 * while 27 slots were full.
+		 */
+		if (!atomic_read(&g_ev_on)) {
+			atomic_set(&g_ft_calls, 0);
+			atomic_set(&g_ft_matched, 0);
+		}
 		mh_ft_register();
 		atomic_set(&g_ev_on, 1);
 	} else {
