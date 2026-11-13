@@ -2,18 +2,18 @@
     "metamodule": true,
     "summary": {
         "en": "Meta module for magic mount support",
-        "zh": "magic mount挂载支持"
+        "zh": "magic mount 挂载支持"
     },
     "description": {
-        "en": "This module is APatch build-in mount system, some module need",
-        "zh": ""
+        "en": "Mounts every module tree with magic mount and hides the result with the magic_hide kernel module: records are dropped from /proc/*/mountinfo, and stat()/statx()/statfs() on a replaced path still answer with the partition it covers.",
+        "zh": "使用 magic mount 挂载所有模块目录，并由 magic_hide 内核模块完成隐藏：从 /proc/*/mountinfo 中移除记录，同时让被替换路径上的 stat()/statx()/statfs() 返回其覆盖分区的身份。"
     },
-    "sourceUrl": "https://github.com/AndroidPatch/magic_mount",
-    "downloadUrl": "https://github.com/AndroidPatch/magic_mount/releases/download/0.2/magic_mount.zip",
+    "sourceUrl": "https://github.com/SHuiTU68/magic_mount",
+    "downloadUrl": "https://github.com/SHuiTU68/magic_mount/releases/latest/download/magic_mount.zip",
     "modulename": "Magic Meta Module",
     "authors": ["APatch Modules Team"],
     "license": "GPL-2.0-only",
     "moduleid": "magic_mount",
-    "version": "2",
-    "VersionCode": 2
+    "version": "3",
+    "VersionCode": 3
 }

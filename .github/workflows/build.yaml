@@ -66,3 +66,21 @@ jobs:
         with:
           name: magic_mount
           path: build
+
+      # Tags are the release channel: module.json points its downloadUrl at
+      # releases/latest/download/magic_mount.zip, so a tag has to produce that
+      # exact asset.  Branch pushes only upload the workflow artifact.
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          (cd build && zip -r9 ../magic_mount.zip .)
+          ls -lh magic_mount.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            && gh release upload "$GITHUB_REF_NAME" magic_mount.zip --clobber \
+            || gh release create "$GITHUB_REF_NAME" magic_mount.zip --generate-notes

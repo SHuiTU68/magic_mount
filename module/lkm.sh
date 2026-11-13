@@ -37,6 +37,42 @@ loaded() {
 	grep -q '^magic_hide ' /proc/modules 2>/dev/null
 }
 
+# Subcommands exist so the metamodule's action button and an uninstall can ask
+# about (or drop) the module without duplicating the KMI logic above.
+case "${1:-load}" in
+status)
+	printf 'kernel:  %s\n' "$(uname -r 2>/dev/null)"
+	printf 'arch:    %s\n' "$(uname -m 2>/dev/null)"
+	if loaded; then
+		printf 'state:   loaded\n'
+	else
+		printf 'state:   not loaded\n'
+	fi
+	printf 'shipped:'
+	if [ -d "$LKM_DIR" ]; then
+		for f in "$LKM_DIR"/magic_hide*.ko; do
+			[ -f "$f" ] || continue
+			printf ' %s' "${f##*/}"
+		done
+		printf '\n'
+	else
+		printf ' (no lkm/ in the module)\n'
+	fi
+	printf 'stats:   %s\n' \
+		"$(sed -n '1p' "$MODDIR/mount-stats.txt" 2>/dev/null || echo none)"
+	exit 0
+	;;
+unload)
+	# Only ever used for debugging: unloading while the mounts are still in
+	# place exposes every module file, so a normal uninstall waits for reboot.
+	loaded || { msg "not loaded"; exit 0; }
+	RMMOD=$(command -v rmmod 2>/dev/null)
+	[ -n "$RMMOD" ] || RMMOD=/system/bin/rmmod
+	"$RMMOD" magic_hide 2>/dev/null && msg "unloaded magic_hide"
+	exit 0
+	;;
+esac
+
 [ -d "$LKM_DIR" ] || { msg "no lkm/ directory in the module"; exit 0; }
 [ "$(id -u 2>/dev/null)" = "0" ] || exit 0
 loaded && exit 0

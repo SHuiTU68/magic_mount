@@ -1,7 +1,7 @@
 id=magic_mount
-name=Magisk Mount
-version=2
-versionCode=2
+name=Magic Mount
+version=3
+versionCode=3
 author=Admirepowered,5ec1cff
-description=For build-in mount
+description=Magic mount for metamodules, with kernel-level hiding of the result
 metamodule=1
