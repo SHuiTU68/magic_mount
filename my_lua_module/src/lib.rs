@@ -51,6 +51,41 @@ unsafe extern "C-unwind" fn refresh_hide(state: *mut lua_State) -> c_int { unsaf
     1
 }}
 
+/// Start or stop the LKM's caller observer and return what it collected.
+///
+/// The observer is the ftrace probe on the stat syscalls, so the LKM knows
+/// which uids query the mount table without a kprobe on the hot path.
+unsafe extern "C-unwind" fn observe_hide(state: *mut lua_State) -> c_int { unsafe {
+    let on = lua_toboolean(state, 1) != 0;
+    let events = hide::observe(on);
+
+    lua_newtable(state);
+    for (i, ev) in events.iter().enumerate() {
+        lua_newtable(state);
+        lua_pushinteger(state, ev.uid as _);
+        lua_setfield(state, -2, b"uid\0".as_ptr() as _);
+        lua_pushinteger(state, ev.pid as _);
+        lua_setfield(state, -2, b"pid\0".as_ptr() as _);
+        lua_pushinteger(state, ev.count as _);
+        lua_setfield(state, -2, b"count\0".as_ptr() as _);
+        lua_pushstring(state, ev.op_name().as_ptr() as _);
+        lua_setfield(state, -2, b"op\0".as_ptr() as _);
+        let comm = ev.comm();
+        lua_pushlstring(state, comm.as_ptr() as _, comm.len());
+        lua_setfield(state, -2, b"comm\0".as_ptr() as _);
+        lua_rawseti(state, -2, (i + 1) as _);
+    }
+    1
+}}
+
+/// Apply `hide-exempt-uids`, drain the observer table and write
+/// `hide-events.log`.  Called at boot_completed.
+unsafe extern "C-unwind" fn report_hide(state: *mut lua_State) -> c_int { unsafe {
+    let ok = hide::report();
+    lua_pushboolean(state, if ok { 1 } else { 0 });
+    1
+}}
+
 /// Plain C entry points used by lkm/loader.
 ///
 /// The loader runs the mount pass in a child process so that a panic, a
@@ -107,5 +142,11 @@ pub unsafe extern "C" fn luaopen_libmagic_mount(state: *mut lua_State) -> c_int 
 
     lua_pushcfunction(state, refresh_hide);
     lua_setfield(state, -2, b"refresh_hide\0".as_ptr() as _);
+
+    lua_pushcfunction(state, observe_hide);
+    lua_setfield(state, -2, b"observe_hide\0".as_ptr() as _);
+
+    lua_pushcfunction(state, report_hide);
+    lua_setfield(state, -2, b"report_hide\0".as_ptr() as _);
     1
 }}

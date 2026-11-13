@@ -87,6 +87,23 @@ local function fallback_refresh()
     end
 end
 
+-- Caller observation is driven by the LKM's ftrace probe on the stat
+-- syscalls.  Turning it on costs one atomic read per stat; the table is
+-- drained once at boot_completed and written to hide-events.log.
+local function observe(on)
+    local lib = library()
+    if lib and type(lib.observe_hide) == "function" then
+        pcall(lib.observe_hide, on)
+    end
+end
+
+local function report()
+    local lib = library()
+    if lib and type(lib.report_hide) == "function" then
+        pcall(lib.report_hide)
+    end
+end
+
 function M.version()
     return 4
 end
@@ -107,6 +124,8 @@ function M.post_mount(superkey)
     if code == nil or code == 2 then
         fallback_mount(source)
     end
+    -- From here on, record who queries the result; boot_completed drains it.
+    observe(true)
 end
 
 function M.service(superkey)
@@ -123,6 +142,9 @@ function M.boot_completed(superkey)
     if code == nil or code == 2 then
         fallback_refresh()
     end
+    -- Everything that inspects the mount table has run by now: close the
+    -- observer, apply hide-exempt-uids and keep the summary.
+    report()
 end
 
 function M.action()

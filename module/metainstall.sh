@@ -70,7 +70,7 @@ clean_old_files() {
 	find "$target" -type f | while IFS= read -r path; do
 		rel=${path#"$target"/}
 		case "$rel" in
-		files.list | module.prop | mount-stats.txt | mount-failures | disable | remove | skip_mount | update)
+		files.list | module.prop | mount-stats.txt | mount-failures | hide-exempt-uids | hide-events.log | disable | remove | skip_mount | update)
 			continue
 			;;
 		esac

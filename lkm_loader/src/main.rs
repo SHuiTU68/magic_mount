@@ -235,14 +235,57 @@ fn candidates() -> Vec<PathBuf> {
     out
 }
 
+/// The LKM's ftrace observer needs the syscall wrapper addresses, which are not
+/// exported to modules on GKI.  They are ordinary kallsyms entries, so read
+/// them here (root) and hand them over as module parameters at insert time.
+///
+/// A kernel with kptr_restrict=2 reports 0 to a process without CAP_SYSLOG; in
+/// that case the parameters are simply omitted and only the observer is lost,
+/// the mount hiding itself is unaffected.
+fn ftrace_params() -> String {
+    const SYMS: [&str; 4] = [
+        "addr_statx=__arm64_sys_statx",
+        "addr_newfstatat=__arm64_sys_newfstatat",
+        "addr_statfs=__arm64_sys_statfs",
+        "addr_fstatfs=__arm64_sys_fstatfs",
+    ];
+
+    let Ok(data) = fs::read("/proc/kallsyms") else {
+        return String::new();
+    };
+    let Ok(text) = String::from_utf8(data) else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    for spec in SYMS {
+        let (param, want) = spec.split_once('=').expect("spec");
+        for line in text.lines() {
+            // "ffff8000... t __arm64_sys_statx"
+            let mut it = line.split_whitespace();
+            let (Some(addr), Some(_ty), Some(name)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            if name != want || addr == "0000000000000000" {
+                continue;
+            }
+            if u64::from_str_radix(addr, 16).is_ok() {
+                out.push_str(&format!("{param}=0x{addr} "));
+            }
+            break;
+        }
+    }
+    out.trim_end().to_string()
+}
+
 fn insert(path: &Path) -> Result<(), String> {
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let empty = CString::new("").expect("empty");
+    let params = CString::new(ftrace_params()).map_err(|e| e.to_string())?;
     let rc = unsafe {
         syscall(
             SYS_FINIT_MODULE,
             file.as_raw_fd() as c_long,
-            empty.as_ptr() as c_long,
+            params.as_ptr() as c_long,
             0 as c_long,
         )
     };
@@ -253,7 +296,10 @@ fn insert(path: &Path) -> Result<(), String> {
     // Old or hardened kernels are not always happy with finit_module; the
     // stock insmod binary does the same open+init dance with its own checks.
     for insmod in ["/system/bin/insmod", "/vendor/bin/insmod", "insmod"] {
-        let out = Command::new(insmod).arg(path).output();
+        let out = Command::new(insmod)
+            .arg(path)
+            .args(ftrace_params().split_whitespace())
+            .output();
         if let Ok(out) = out {
             if out.status.success() {
                 return Ok(());

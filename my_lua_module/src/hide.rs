@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MH_PAGE_SIZE: usize = 4096;
 const MH_PAYLOAD_MAGIC: u32 = 0x4d48_5359; // "MHSY"
-const MH_PAYLOAD_VERSION: u32 = 3; // 3: records carry Ukstat
+const MH_PAYLOAD_VERSION: u32 = 4; // 4: POLICY + EVENTS
 const MH_PATH_MAX: usize = 512;
 const MH_BUF_MAX: usize = MH_PAGE_SIZE - std::mem::size_of::<Uhdr>();
 
@@ -39,6 +39,8 @@ const MH_CMD_RESET: u32 = 0;
 const MH_CMD_ADD: u32 = 1;
 const MH_CMD_MODE: u32 = 2;
 const MH_CMD_REFRESH: u32 = 4;
+const MH_CMD_POLICY: u32 = 5;
+const MH_CMD_EVENTS: u32 = 6;
 
 const MH_MODE_ALL: u32 = 1;
 
@@ -381,6 +383,147 @@ pub fn refresh() -> bool {
     }
 }
 
+const MH_EV_MAX: usize = 64;
+const MH_EXEMPT_MAX: usize = 64;
+const MH_COMM_LEN: usize = 16;
+
+/// Wire layout of `struct mh_uevent`: one caller of the stat family, as seen by
+/// the LKM's ftrace probe on the syscall wrappers.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Uevent {
+    uid: u32,
+    pid: u32,
+    op: u32,
+    count: u32,
+    comm: [u8; MH_COMM_LEN],
+}
+
+/// One process that called stat/statfs, coalesced per uid by the kernel.
+#[derive(Clone, Copy, Default)]
+pub struct Observer {
+    pub uid: u32,
+    pub pid: u32,
+    pub op: u32,
+    pub count: u32,
+    comm: [u8; MH_COMM_LEN],
+}
+
+impl Observer {
+    /// `comm` is a fixed 16-byte field, not necessarily NUL terminated.
+    pub fn comm(&self) -> String {
+        let end = self.comm.iter().position(|c| *c == 0).unwrap_or(MH_COMM_LEN);
+        String::from_utf8_lossy(&self.comm[..end]).into_owned()
+    }
+
+    pub fn op_name(&self) -> &'static str {
+        match self.op {
+            0 => "statx",
+            1 => "newfstatat",
+            2 => "statfs",
+            3 => "fstatfs",
+            _ => "?",
+        }
+    }
+}
+
+/// Processes that must keep seeing the real mount table.  An empty slice clears
+/// the set, which restores the default of hiding from everyone.
+pub fn set_exempt(uids: &[u32]) -> bool {
+    if uids.len() > MH_EXEMPT_MAX {
+        return false;
+    }
+    let Some(mut payload) = Payload::new() else {
+        return false;
+    };
+    {
+        let buf = payload.buf_mut();
+        for (i, uid) in uids.iter().enumerate() {
+            let at = i * std::mem::size_of::<u32>();
+            buf[at..at + 4].copy_from_slice(&uid.to_ne_bytes());
+        }
+    }
+    payload.send(
+        MH_CMD_POLICY,
+        uids.len() as u32,
+        (uids.len() * std::mem::size_of::<u32>()) as u32,
+    )
+}
+
+/// Turn the caller observer on or off and return (and clear) what it collected.
+///
+/// Enabling is cheap in the kernel: the ftrace probe is already registered at
+/// load time, the switch is one atomic read per stat call while active.
+pub fn observe(on: bool) -> Vec<Observer> {
+    let Some(mut payload) = Payload::new() else {
+        return Vec::new();
+    };
+    if !payload.send_mode(MH_CMD_EVENTS, u32::from(on), 0, 0) {
+        return Vec::new();
+    }
+    let count = (payload.hdr().count as usize).min(MH_EV_MAX);
+    let buf = payload.buf_mut();
+    (0..count)
+        .map(|i| {
+            // SAFETY: the kernel wrote `count` Uevent records at the start of
+            // the buffer and Uevent is repr(C) with no padding.
+            let ev: Uevent = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr().add(i * std::mem::size_of::<Uevent>())
+                    as *const Uevent)
+            };
+            Observer {
+                uid: ev.uid,
+                pid: ev.pid,
+                op: ev.op,
+                count: ev.count,
+                comm: ev.comm,
+            }
+        })
+        .collect()
+}
+
+/// Module directory; the loader derives its own path the same way, but this
+/// side is called from the Lua host, which does not pass MODDIR down.
+const MODULE_DIR: &str = "/data/adb/modules/magic_mount";
+
+/// Drain the observer table, apply the exemption list from the module directory
+/// and keep a readable summary.  Called once the boot is over: everything that
+/// inspects the mount table has had its chance by then.
+pub fn report() -> bool {
+    let dir = Path::new(MODULE_DIR);
+    let mut policy = false;
+
+    if let Ok(text) = std::fs::read_to_string(dir.join("hide-exempt-uids")) {
+        let uids: Vec<u32> = text
+            .lines()
+            .filter_map(|line| line.split('#').next())
+            .filter_map(|line| line.trim().parse().ok())
+            .collect();
+        policy = set_exempt(&uids);
+    }
+
+    let observers = observe(false);
+    let mut log = String::from("# magic_hide observers: uid pid op count comm\n");
+    let mut sorted = observers;
+    sorted.sort_by(|a, b| b.count.cmp(&a.count));
+    for o in &sorted {
+        log.push_str(&format!(
+            "{} {} {} {} {}\n",
+            o.uid,
+            o.pid,
+            o.op_name(),
+            o.count,
+            o.comm()
+        ));
+    }
+    let _ = std::fs::write(dir.join("hide-events.log"), log);
+
+    if !sorted.is_empty() {
+        log::info!("magic_hide saw {} distinct callers", sorted.len());
+    }
+    policy || !sorted.is_empty()
+}
+
 /// The payload page handed to the kernel.  `get_user_pages_fast()` works on
 /// page boundaries, so the buffer has to be page aligned.
 struct Payload {
@@ -413,11 +556,16 @@ impl Payload {
     /// Zero the page, fill the header and hand it to the LKM.  Returns false
     /// when the module is not loaded or the command was rejected.
     fn send(&mut self, cmd: u32, count: u32, data_size: u32) -> bool {
+        let mode = if cmd == MH_CMD_MODE { MH_MODE_ALL } else { 0 };
+        self.send_mode(cmd, mode, count, data_size)
+    }
+
+    fn send_mode(&mut self, cmd: u32, mode: u32, count: u32, data_size: u32) -> bool {
         let hdr = self.hdr();
         hdr.magic = MH_PAYLOAD_MAGIC;
         hdr.version = MH_PAYLOAD_VERSION;
         hdr.cmd = cmd;
-        hdr.mode = if cmd == MH_CMD_MODE { MH_MODE_ALL } else { 0 };
+        hdr.mode = mode;
         hdr.status = 0;
         hdr.count = count;
         hdr.data_size = data_size;

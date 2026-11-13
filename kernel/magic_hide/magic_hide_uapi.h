@@ -30,7 +30,7 @@ typedef int32_t  mh_s32;
 
 #define MH_PAGE_SIZE        4096u
 #define MH_PAYLOAD_MAGIC    0x4d485359u /* "MHSY" */
-#define MH_PAYLOAD_VERSION  3u /* 3: records carry mh_ukstat */
+#define MH_PAYLOAD_VERSION  4u /* 4: POLICY + EVENTS (process-level) */
 #define MH_PATH_MAX         512
 
 /* Key type used by the LKM; add_key() is cancelled right after it runs. */
@@ -43,6 +43,8 @@ enum mh_cmd {
 	MH_CMD_MODE  = 2, /* change the per-uid visibility policy           */
 	MH_CMD_OFF   = 3, /* RESET + MH_MODE_OFF                            */
 	MH_CMD_REFRESH = 4, /* re-resolve paths, keep the published identity */
+	MH_CMD_POLICY = 5, /* replace the exempt uid set (process-level)     */
+	MH_CMD_EVENTS = 6, /* dump observed syscall callers, then clear      */
 };
 
 enum mh_mode {
@@ -84,6 +86,24 @@ struct mh_ustatfs {
 	mh_u64 f_namelen;
 	mh_u64 f_frsize;
 	mh_u64 f_fsid;
+};
+
+/*
+ * One observed caller of the stat family, reported by the ftrace probe on the
+ * syscall wrappers.  The LKM keeps a fixed direct-mapped table keyed by uid and
+ * MH_CMD_EVENTS returns it, so the module can decide which processes should be
+ * exempt from hiding (see MH_CMD_POLICY).  op: 0 statx, 1 newfstatat, 2 statfs,
+ * 3 fstatfs.
+ */
+#define MH_EV_MAX   64
+#define MH_COMM_LEN 16
+
+struct mh_uevent {
+	mh_u32 uid;
+	mh_u32 pid;
+	mh_u32 op;
+	mh_u32 count;
+	mh_u8 comm[MH_COMM_LEN];
 };
 
 /*

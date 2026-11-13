@@ -89,6 +89,7 @@
 #include <linux/dcache.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
+#include <linux/ftrace.h>
 #include <linux/hash.h>
 #include <linux/highmem.h>
 #include <linux/init.h>
@@ -100,6 +101,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mount.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
@@ -219,19 +221,257 @@ static atomic_t g_anchor_count = ATOMIC_INIT(0);
 #endif
 
 /* ------------------------------------------------------------------ */
-/* visibility policy                                                   */
+/* exempt uids (process-level policy)                                  */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Processes that must keep seeing the real state even while hiding is on, for
+ * example a system service that mmaps from a partition magic_mount replaced.
+ * The set is published by the module (MH_CMD_POLICY), sorted so the hot check
+ * is a binary search, and read under RCU like the anchor table.
+ */
+#define MH_EXEMPT_MAX 64
+
+struct mh_uidset {
+	struct rcu_head rcu;
+	u32 n;
+	u32 uid[MH_EXEMPT_MAX];
+};
+
+static struct mh_uidset __rcu *g_exempt;
+
+static bool mh_uid_exempt(u32 uid)
+{
+	struct mh_uidset *set;
+	u32 lo = 0, hi;
+	bool hit = false;
+
+	rcu_read_lock();
+	set = rcu_dereference(g_exempt);
+	if (set && set->n) {
+		hi = set->n;
+		while (lo < hi) {
+			u32 mid = lo + (hi - lo) / 2;
+
+			if (set->uid[mid] == uid) {
+				hit = true;
+				break;
+			}
+			if (set->uid[mid] < uid)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+	}
+	rcu_read_unlock();
+	return hit;
+}
+
+/* Called with g_mutex held. */
+static int mh_set_exempt(const u32 *uids, u32 n)
+{
+	struct mh_uidset *set, *old;
+	u32 i, j;
+
+	if (n > MH_EXEMPT_MAX)
+		return -EINVAL;
+
+	set = NULL;
+	if (n) {
+		set = kzalloc(sizeof(*set), GFP_KERNEL);
+		if (!set)
+			return -ENOMEM;
+		memcpy(set->uid, uids, n * sizeof(u32));
+		set->n = n;
+		/* insertion sort; n is at most 64 */
+		for (i = 1; i < n; i++) {
+			u32 v = set->uid[i];
+
+			for (j = i; j > 0 && set->uid[j - 1] > v; j--)
+				set->uid[j] = set->uid[j - 1];
+			set->uid[j] = v;
+		}
+	}
+
+	old = rcu_dereference_protected(g_exempt, lockdep_is_held(&g_mutex));
+	rcu_assign_pointer(g_exempt, set);
+	if (old)
+		kfree_rcu(old, rcu);
+	return 0;
+}
 
 static bool mh_hide_for_current(void)
 {
 	enum mh_mode mode = READ_ONCE(g_mode);
+	u32 uid;
 
-	if (mode == MH_MODE_ALL)
-		return true;
 	if (mode == MH_MODE_OFF)
 		return false;
-	return current_fsuid().val != 0;
+	uid = (u32)current_fsuid().val;
+	if (mode == MH_MODE_APPS && uid == 0)
+		return false;
+	return !mh_uid_exempt(uid);
 }
+
+/* ------------------------------------------------------------------ */
+/* caller observation (ftrace, not kprobe)                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The kretprobes below answer "what should this call return".  They cannot
+ * answer "who is asking" without deciding inside the kprobe, and a kprobe
+ * cannot be attached to a function that ftrace already patches on arm64.  The
+ * caller identity therefore comes from a second, independent hook: an ftrace
+ * op on the syscall wrappers, which is registered at boot (addresses are
+ * resolved by lkm/loader from /proc/kallsyms and passed as module parameters)
+ * and records uid/pid/comm per syscall into a small direct-mapped table.
+ *
+ * The module drains that table through MH_CMD_EVENTS and answers with
+ * MH_CMD_POLICY, so the exemption list is decided in userspace with the actual
+ * process list in hand, not guessed inside the kernel.
+ */
+#if IS_ENABLED(CONFIG_FUNCTION_TRACER) && IS_ENABLED(CONFIG_DYNAMIC_FTRACE)
+
+#define MH_HAVE_FTRACE 1
+
+static unsigned long g_ft_ip[4];
+module_param_named(addr_statx, g_ft_ip[0], ulong, 0);
+module_param_named(addr_newfstatat, g_ft_ip[1], ulong, 0);
+module_param_named(addr_statfs, g_ft_ip[2], ulong, 0);
+module_param_named(addr_fstatfs, g_ft_ip[3], ulong, 0);
+
+struct mh_ev_slot {
+	u32 uid;
+	u32 pid;
+	u32 op;
+	atomic_t count;
+	char comm[MH_COMM_LEN];
+};
+
+static struct mh_ev_slot g_ev[MH_EV_MAX];
+static atomic_t g_ev_on = ATOMIC_INIT(0);
+static bool g_ft_armed;
+
+static void mh_ft_hit(unsigned long ip)
+{
+	u32 uid = (u32)current_fsuid().val;
+	struct mh_ev_slot *s = &g_ev[(uid * 2654435761u) % MH_EV_MAX];
+	u32 op;
+
+	for (op = 0; op < 4; op++) {
+		if (g_ft_ip[op] == ip)
+			break;
+	}
+	if (op == 4)
+		return;
+
+	if (READ_ONCE(s->uid) != uid) {
+		WRITE_ONCE(s->uid, 0);
+		WRITE_ONCE(s->pid, 0);
+		atomic_set(&s->count, 0);
+		memset(s->comm, 0, sizeof(s->comm));
+		strscpy(s->comm, current->comm, sizeof(s->comm));
+		WRITE_ONCE(s->uid, uid);
+	}
+	WRITE_ONCE(s->pid, current->pid);
+	WRITE_ONCE(s->op, op);
+	atomic_inc(&s->count);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static void mh_ft_cb(unsigned long ip, unsigned long parent_ip,
+		     struct ftrace_ops *ops, struct ftrace_regs *fregs)
+#else
+static void mh_ft_cb(unsigned long ip, unsigned long parent_ip,
+		     struct ftrace_ops *ops, struct pt_regs *regs)
+#endif
+{
+	(void)parent_ip;
+	(void)ops;
+	if (!atomic_read(&g_ev_on))
+		return;
+	mh_ft_hit(ip);
+}
+
+static struct ftrace_ops g_ft_ops = {
+	.func = mh_ft_cb,
+	.flags = FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_DYNAMIC,
+};
+
+static void mh_ft_register(void)
+{
+	int i, armed = 0;
+
+	if (g_ft_armed)
+		return;
+	for (i = 0; i < 4; i++) {
+		if (!g_ft_ip[i])
+			continue;
+		if (ftrace_set_filter_ip(&g_ft_ops, g_ft_ip[i], 0, 0))
+			pr_debug("cannot filter syscall %d\n", i);
+		else
+			armed++;
+	}
+	if (!armed)
+		return;
+	if (register_ftrace_function(&g_ft_ops)) {
+		pr_debug("cannot register ftrace observer\n");
+		return;
+	}
+	g_ft_armed = true;
+}
+
+static void mh_ft_unregister(void)
+{
+	if (!g_ft_armed)
+		return;
+	unregister_ftrace_function(&g_ft_ops);
+	g_ft_armed = false;
+	atomic_set(&g_ev_on, 0);
+}
+
+static u32 mh_events_dump(struct mh_upayload *pl, bool on)
+{
+	struct mh_uevent *out = (struct mh_uevent *)pl->buf;
+	u32 i, n = 0;
+
+	atomic_set(&g_ev_on, on ? 1 : 0);
+	if (on)
+		mh_ft_register();
+
+	for (i = 0; i < MH_EV_MAX; i++) {
+		struct mh_ev_slot *s = &g_ev[i];
+		int cnt = atomic_read(&s->count);
+
+		if (!cnt || !READ_ONCE(s->uid))
+			continue;
+		out[n].uid = READ_ONCE(s->uid);
+		out[n].pid = READ_ONCE(s->pid);
+		out[n].op = READ_ONCE(s->op);
+		out[n].count = (u32)cnt;
+		memcpy(out[n].comm, s->comm, MH_COMM_LEN);
+		atomic_set(&s->count, 0);
+		n++;
+	}
+	return n;
+}
+
+#else /* no dynamic ftrace in this kernel */
+
+#define MH_HAVE_FTRACE 0
+
+static u32 mh_events_dump(struct mh_upayload *pl, bool on)
+{
+	(void)pl;
+	(void)on;
+	return 0;
+}
+
+static void mh_ft_unregister(void)
+{
+}
+
+#endif /* CONFIG_FUNCTION_TRACER && CONFIG_DYNAMIC_FTRACE */
 
 /* ------------------------------------------------------------------ */
 /* anchor table                                                        */
@@ -1248,6 +1488,21 @@ static int mh_process_payload(unsigned long user_addr)
 	case MH_CMD_REFRESH:
 		ret = mh_records_refresh();
 		break;
+	case MH_CMD_POLICY:
+		if (pl->hdr.count > MH_EXEMPT_MAX ||
+		    pl->hdr.data_size < pl->hdr.count * (u32)sizeof(u32) ||
+		    pl->hdr.data_size > MH_BUF_MAX) {
+			ret = -EINVAL;
+			break;
+		}
+		mutex_lock(&g_mutex);
+		ret = mh_set_exempt((const u32 *)pl->buf, pl->hdr.count);
+		mutex_unlock(&g_mutex);
+		break;
+	case MH_CMD_EVENTS:
+		pl->hdr.count = mh_events_dump(pl, pl->hdr.mode != 0);
+		pl->hdr.data_size = pl->hdr.count * (u32)sizeof(struct mh_uevent);
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -1349,14 +1604,15 @@ static int __init magic_hide_init(void)
 		pr_err("no hook could be installed\n");
 		return -ENOENT;
 	}
-	pr_info("loaded: mountinfo=%d vfsmnt=%d vfsstat=%d modules=%d kprobes=%d mode=%d\n",
+	pr_info("loaded: mountinfo=%d vfsmnt=%d vfsstat=%d modules=%d kprobes=%d mode=%d ftrace=%d\n",
 		g_reg_mountinfo, g_reg_vfsmnt, g_reg_vfsstat, g_reg_modules,
-		g_reg_kprobes, (int)g_mode);
+		g_reg_kprobes, (int)g_mode, MH_HAVE_FTRACE);
 	return 0;
 }
 
 static void __exit magic_hide_exit(void)
 {
+	mh_ft_unregister();
 #if IS_ENABLED(CONFIG_KEYS)
 	if (g_key_registered)
 		unregister_key_type(&mh_key_type);
