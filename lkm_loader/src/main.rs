@@ -14,7 +14,7 @@
 //! directory are both derived from the running executable - nothing here
 //! hardcodes /data/adb/modules/magic_mount.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -118,12 +118,15 @@ fn property(name: &str) -> String {
     let Ok(key) = CString::new(name) else {
         return String::new();
     };
-    let mut buf = [0i8; 92];
+    // c_char is u8 on aarch64-linux-android, i8 elsewhere; the buffer follows
+    // the target, the string conversion goes through bytes.
+    let mut buf = [0 as c_char; 92];
     let len = unsafe { __system_property_get(key.as_ptr(), buf.as_mut_ptr()) };
     if len <= 0 {
         return String::new();
     }
-    unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
+    let bytes: Vec<u8> = buf.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn loaded() -> bool {
