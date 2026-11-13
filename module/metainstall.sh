@@ -92,6 +92,12 @@ fi
 # above (the partition links in particular) is only packaged if it runs after.
 install_module
 
+target="${NVBASE:-/data/adb}/modules/${MODID:-magic_mount}"
+
 # Installing a new build is the user's way out of the safe-mode skip, so the
 # consecutive-failure count starts from zero again.
-rm -f "${NVBASE:-/data/adb}/modules/${MODID:-magic_mount}/mount-failures"
+rm -f "$target/mount-failures"
+
+# The loader is executed directly by the metamodule; a zip that lost the mode
+# would make lkm/loader exit 126 and the module would silently mount nothing.
+chmod 755 "$MODPATH/lkm/loader" "$target/lkm/loader" 2>/dev/null
