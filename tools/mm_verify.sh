@@ -185,6 +185,30 @@ check_donor() {
     esac
 }
 
+# Cost of the hot path.  magic_hide intercepts stat()/statfs() for every
+# process, so the per-call delta on a covered path is the number to compare
+# across builds.  Informational: latency depends on the device and its load,
+# so there is no threshold to fail on.
+check_overhead() {
+    sec "overhead (probe fast path)"
+
+    d=$(mmdir) || { skip "module directory not found"; return; }
+    loader=$d/lkm/loader
+    if [ ! -x "$loader" ]; then
+        skip "no loader at $loader"
+        return
+    fi
+
+    out=$("$loader" bench 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        skip "bench could not run: $(printf '%s\n' "$out" | head -n 1)"
+        return
+    fi
+    printf '%s\n' "$out" | head -n 8 | sed 's/^/      /'
+    info "per-syscall cost above is informational"
+}
+
 check_hide() {
     sec "magic_hide"
 
@@ -309,6 +333,13 @@ check_timing() {
     while IFS= read -r line; do
         printf '      %s\n' "$line"
     done <"$f"
+
+    summary=$(head -n 1 "$f")
+    total=$(printf '%s\n' "$summary" | sed -n 's/.*total_us=\([0-9]*\).*/\1/p')
+    count=$(printf '%s\n' "$summary" | sed -n 's/.*mountpoints=\([0-9]*\).*/\1/p')
+    if [ -n "$total" ] && [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
+        info "$((total / count)) us per mountpoint ($count mountpoints)"
+    fi
 }
 
 # Who asked for stat/statfs during boot.  The kernel records uid/pid/op/comm
@@ -453,6 +484,7 @@ printf 'magic_mount self check\n'
 check_hide
 check_mount_table
 check_donor
+check_overhead
 check_identity
 check_timing
 check_observers

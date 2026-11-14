@@ -25,7 +25,6 @@ use std::os::fd::FromRawFd;
 use std::os::raw::{c_char, c_int, c_long, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -89,11 +88,12 @@ fn main() {
         "status" => status(),
         "unload" => unload(),
         "donor-check" => donor_check(),
+        "bench" => bench(),
         "__mount" => run_native("magic_mount_exec", args.get(2).map(String::as_str).unwrap_or("APatch")),
         "__refresh" => run_native("refresh_hide_exec", ""),
         "__donor-view" => donor_view(),
         other => {
-            eprintln!("usage: loader [load|mount <source>|refresh|status|unload|donor-check] (got {other})");
+            eprintln!("usage: loader [load|mount <source>|refresh|status|unload|donor-check|bench [n]] (got {other})");
             exit(64);
         }
     }
@@ -817,6 +817,15 @@ mod tests {
         assert_eq!(b_only.len(), 1);
         assert!(b_only[0].starts_with("/system\t"));
     }
+
+    #[test]
+    fn collects_only_mountpoints() {
+        let text = "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 /foo /x\\040y rw - tmpfs a rw\n";
+        let points = mount_points(text);
+        assert_eq!(points.len(), 2);
+        assert!(points.contains("/"));
+        assert!(points.contains("/x y"));
+    }
 }
 
 // ---------------------------------------------------------------- commands
@@ -1029,6 +1038,10 @@ fn status() {
     );
     println!("dir:      {}", module_dir().display());
     println!("failures: {}", read_count(&failures_file()));
+    let records = fs::read_to_string(module_dir().join("hide-records.map"))
+        .map(|text| text.lines().filter(|line| !line.is_empty()).count())
+        .unwrap_or(0);
+    println!("records:  {records}");
 
     let tried: Vec<String> = candidates()
         .iter()
@@ -1092,6 +1105,7 @@ extern "C" {
         data: *const c_void,
     ) -> c_int;
     fn umount2(target: *const c_char, flags: c_int) -> c_int;
+    fn statfs(path: *const c_char, buf: *mut StatfsBuf) -> c_int;
     fn getuid() -> u32;
 }
 
@@ -1184,12 +1198,88 @@ fn only_in(a: &[MiMount], b: &[MiMount]) -> (Vec<String>, Vec<String>) {
     (a_only, b_only)
 }
 
-/// The child half: by now the namespace is a private copy with every published
-/// mountpoint detached, so this is the table a stock device would show.
+/// Every mountpoint in a mountinfo snapshot.  The donor child only needs this
+/// set, so it skips the parent/id work the full parser does.
+fn mount_points(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let split = line.find(" - ")?;
+            let left: Vec<&str> = line[..split].split_whitespace().collect();
+            if left.len() < 5 {
+                return None;
+            }
+            Some(unescape(left[4]))
+        })
+        .collect()
+}
+
+/// The child half: enter a private copy of the mount namespace, detach every
+/// published mountpoint, then print what is left.  The work happens after
+/// `exec`, so no allocation runs between fork and exec, and only paths that
+/// really are mountpoints here cost a syscall.
 fn donor_view() {
-    let text = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let Some(map) = std::env::args().nth(2) else {
+        eprintln!("donor-view: missing record list");
+        exit(2);
+    };
+    let text = match fs::read_to_string(&map) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("donor-view: cannot read {map}: {err}");
+            exit(2);
+        }
+    };
+    let mut records: Vec<String> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    // Deepest first: a bind mount lives on the tmpfs skeleton above it, so it
+    // has to be detached before that skeleton goes away.
+    records.sort_by_key(|path| std::cmp::Reverse(path.len()));
+
+    let root = CString::new("/").expect("literal");
+    if unsafe { unshare(CLONE_NEWNS) } != 0 {
+        eprintln!("donor-view: unshare: {}", std::io::Error::last_os_error());
+        exit(2);
+    }
+    // Must happen before the first umount: the copy still shares propagation
+    // with the parent namespace, and a shared unmount would remove our mounts
+    // from the running system.
+    let rc = unsafe {
+        mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            MS_REC | MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        eprintln!(
+            "donor-view: private propagation: {}",
+            std::io::Error::last_os_error()
+        );
+        exit(2);
+    }
+
+    let before = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let points = mount_points(&before);
+    for path in &records {
+        if !points.contains(path) {
+            continue; // stale record, not a mountpoint any more
+        }
+        let Ok(cpath) = CString::new(path.as_str()) else {
+            continue;
+        };
+        unsafe { umount2(cpath.as_ptr(), MNT_DETACH) };
+    }
+
+    // Re-read instead of filtering the first snapshot: detaching our mount can
+    // reveal a stock mount that was covered at the same path.
+    let after = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let mut out = std::io::stdout();
-    let _ = out.write_all(text.as_bytes());
+    let _ = out.write_all(after.as_bytes());
     let _ = out.flush();
     exit(0);
 }
@@ -1203,7 +1293,7 @@ fn donor_check() {
             exit(2);
         }
     };
-    let mut records: Vec<String> = text
+    let records: Vec<String> = text
         .lines()
         .filter(|line| !line.is_empty())
         .map(str::to_string)
@@ -1212,13 +1302,6 @@ fn donor_check() {
         println!("donor-check: {} is empty, nothing published yet", map.display());
         exit(2);
     }
-    // Deepest first: a bind mount lives on the tmpfs skeleton above it, so it
-    // has to be detached before that skeleton goes away.
-    records.sort_by_key(|path| std::cmp::Reverse(path.len()));
-    let paths: Vec<CString> = records
-        .iter()
-        .filter_map(|path| CString::new(path.as_str()).ok())
-        .collect();
 
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -1227,38 +1310,13 @@ fn donor_check() {
             exit(2);
         }
     };
-    let root = CString::new("/").expect("literal");
     let mut cmd = Command::new(exe);
     cmd.arg("__donor-view")
+        .arg(&map)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    unsafe {
-        cmd.pre_exec(move || {
-            if unshare(CLONE_NEWNS) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Must happen before the first umount: the copy still shares
-            // propagation with the parent namespace, and a shared unmount
-            // would remove our mounts from the running system.
-            let rc = mount(
-                std::ptr::null(),
-                root.as_ptr(),
-                std::ptr::null(),
-                MS_REC | MS_PRIVATE,
-                std::ptr::null(),
-            );
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for path in &paths {
-                // One stale record must not abort the whole comparison; a
-                // path that is not a mountpoint simply reports EINVAL.
-                let _ = umount2(path.as_ptr(), MNT_DETACH);
-            }
-            Ok(())
-        });
-    }
 
+    let started = Instant::now();
     let output = match cmd.output() {
         Ok(output) => output,
         Err(err) => {
@@ -1266,12 +1324,14 @@ fn donor_check() {
             exit(2);
         }
     };
+    let namespace_us = started.elapsed().as_micros();
     if !output.status.success() {
         println!("donor-check: donor reader failed: {}", output.status);
         exit(2);
     }
 
     let donor = parse_mountinfo(&String::from_utf8_lossy(&output.stdout));
+    let compare_started = Instant::now();
     let live_all = parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
 
     // A record path is by definition covered, so a line for it means the
@@ -1295,11 +1355,13 @@ fn donor_check() {
 
     let (only_donor, only_live) = only_in(&donor, &live);
     let diff = only_donor.len() + only_live.len();
+    let compare_us = compare_started.elapsed().as_micros();
     println!(
         "donor-check: donor={} live={} diff={diff} covered-visible={visible}",
         donor.len(),
         live.len()
     );
+    println!("  cost: donor_ns={namespace_us}us compare={compare_us}us");
     if visible > 0 {
         println!(
             "  hint: {visible} covered mountpoint(s) are still listed for uid {} (APPS mode exempts root, or magic_hide is not filtering)",
@@ -1309,11 +1371,114 @@ fn donor_check() {
     for line in only_donor.iter().take(8) {
         println!("  only in donor: {}", line.replace('\t', " "));
     }
+    if only_donor.len() > 8 {
+        println!("  ... {} more only in donor", only_donor.len() - 8);
+    }
     for line in only_live.iter().take(8) {
         println!("  only in live:  {}", line.replace('\t', " "));
     }
+    if only_live.len() > 8 {
+        println!("  ... {} more only in live", only_live.len() - 8);
+    }
 
     exit(if diff == 0 { 0 } else { 1 });
+}
+
+// ------------------------------------------------------- overhead probe
+
+const BENCH_ITER: usize = 2000;
+
+/// Opaque storage for `struct statfs`; every Android ABI keeps it well under
+/// 256 bytes and only the return value is used here.
+#[repr(C)]
+struct StatfsBuf {
+    raw: [u64; 32],
+}
+
+fn stat_cost(path: &Path, iterations: usize) -> u128 {
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = fs::metadata(path);
+    }
+    start.elapsed().as_nanos() / iterations.max(1) as u128
+}
+
+fn statfs_cost(path: &Path, iterations: usize) -> Option<u128> {
+    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = StatfsBuf { raw: [0; 32] };
+    let start = Instant::now();
+    for _ in 0..iterations {
+        if unsafe { statfs(cpath.as_ptr(), &mut buf) } != 0 {
+            return None;
+        }
+    }
+    Some(start.elapsed().as_nanos() / iterations.max(1) as u128)
+}
+
+/// Per-call cost of the two syscalls magic_hide intercepts, on a path it covers
+/// and on an ordinary one.  Both sides pay the kretprobe trampoline, so the
+/// difference is what the hot lookup and the forged answer add - that is the
+/// number to watch across builds.  Informational: latencies are noisy and no
+/// threshold is enforced.
+fn bench() {
+    let iterations = std::env::args()
+        .nth(2)
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(BENCH_ITER)
+        .clamp(100, 100_000);
+
+    let map = module_dir().join("hide-records.map");
+    let records = fs::read_to_string(&map).unwrap_or_default();
+    let Some(covered) = records
+        .lines()
+        .find(|line| !line.is_empty() && Path::new(line).exists())
+        .map(Path::new)
+    else {
+        println!("bench: no published mountpoint exists yet (run the mount stage first)");
+        exit(2);
+    };
+    let native = ["/data/local/tmp", "/data"]
+        .iter()
+        .map(Path::new)
+        .find(|path| path.is_dir())
+        .unwrap_or_else(|| Path::new("/"));
+
+    println!(
+        "bench: iter={iterations} covered={} native={}",
+        covered.display(),
+        native.display()
+    );
+
+    let c = stat_cost(covered, iterations);
+    let n = stat_cost(native, iterations);
+    println!(
+        "bench: stat covered_ns={c} native_ns={n} delta_ns={}",
+        c as i128 - n as i128
+    );
+
+    match (
+        statfs_cost(covered, iterations),
+        statfs_cost(native, iterations),
+    ) {
+        (Some(c), Some(n)) => println!(
+            "bench: statfs covered_ns={c} native_ns={n} delta_ns={}",
+            c as i128 - n as i128
+        ),
+        _ => println!("bench: statfs unavailable on this path"),
+    }
+
+    let mut lines = 0;
+    let start = Instant::now();
+    for _ in 0..20 {
+        lines = fs::read_to_string("/proc/self/mountinfo")
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
+    }
+    println!(
+        "bench: mountinfo lines={lines} read_us={}",
+        start.elapsed().as_micros() / 20
+    );
+    exit(0);
 }
 
 fn unload() {
