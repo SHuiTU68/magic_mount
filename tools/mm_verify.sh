@@ -157,6 +157,34 @@ check_mount_table() {
     fi
 }
 
+# The hidden view has to equal a real mount namespace with our mountpoints
+# detached; that donor namespace is what a device without the module reports.
+# `loader donor-check` builds it with unshare + private propagation and
+# compares the two tables, so a line that only exists because of us is caught.
+check_donor() {
+    sec "donor namespace (mountinfo parity)"
+
+    d=$(mmdir) || { skip "module directory not found"; return; }
+    loader=$d/lkm/loader
+    if [ ! -x "$loader" ]; then
+        skip "no loader at $loader"
+        return
+    fi
+    if [ ! -r "$d/hide-records.map" ]; then
+        skip "no hide-records.map yet (the mount stage has not published)"
+        return
+    fi
+
+    out=$("$loader" donor-check 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | head -n 12 | sed 's/^/      /'
+    case "$rc" in
+    0) ok "hidden mountinfo matches the donor namespace" ;;
+    2) skip "donor namespace could not be built (unshare denied?)" ;;
+    *) bad "hidden mountinfo differs from the donor namespace" ;;
+    esac
+}
+
 check_hide() {
     sec "magic_hide"
 
@@ -424,6 +452,7 @@ printf 'magic_mount self check\n'
 
 check_hide
 check_mount_table
+check_donor
 check_identity
 check_timing
 check_observers

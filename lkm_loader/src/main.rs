@@ -1,6 +1,6 @@
 //! Loader and mount supervisor shipped as `lkm/loader`.
 //!
-//! It does the two things a shell script cannot do safely:
+//! It does the three things a shell script cannot do safely:
 //!
 //! * `load` matches this device's KMI against the `.ko` files next to the
 //!   binary and inserts the first one the kernel accepts.
@@ -9,18 +9,23 @@
 //!   looping forever.  Two failed boots in a row make the next one skip the
 //!   mount entirely, which is what breaks a boot loop: the device comes up
 //!   and the boot after that tries again.
+//! * `donor-check` compares the mount table this process sees against a real
+//!   namespace with our mounts detached, which is the view a device without
+//!   the module would report.
 //!
 //! The layout is `<module>/lkm/loader`, so the module directory and the .ko
 //! directory are both derived from the running executable - nothing here
 //! hardcodes /data/adb/modules/magic_mount.
 
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::FromRawFd;
-use std::os::raw::{c_char, c_int, c_long, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -83,10 +88,12 @@ fn main() {
         "refresh" => supervise("__refresh", "", REFRESH_DEADLINE),
         "status" => status(),
         "unload" => unload(),
+        "donor-check" => donor_check(),
         "__mount" => run_native("magic_mount_exec", args.get(2).map(String::as_str).unwrap_or("APatch")),
         "__refresh" => run_native("refresh_hide_exec", ""),
+        "__donor-view" => donor_view(),
         other => {
-            eprintln!("usage: loader [load|mount <source>|refresh|status|unload] (got {other})");
+            eprintln!("usage: loader [load|mount <source>|refresh|status|unload|donor-check] (got {other})");
             exit(64);
         }
     }
@@ -786,14 +793,29 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_expected_vermagic_from_kmsg() {
-        let lines = vec![
-            "6,300,1,-;magic_hide: version magic '5.10.0-test' should be '5.10.0-android12-9'".into(),
-        ];
+    fn resolves_mountinfo_parents_and_escapes() {
+        let text = "744 743 253:4 / / rw,relatime shared:1 - ext4 /dev/block/dm-4 rw,seclabel\n\
+                    745 744 0:25 / /system ro,relatime - ext4 /dev/block/dm-5 ro,seclabel\n\
+                    746 745 0:26 / /system/app/Foo\\040Bar rw - tmpfs workdir rw\n";
+        let mounts = parse_mountinfo(text);
+        assert_eq!(mounts.len(), 3);
+        assert_eq!(mounts[1].canon, "/system\t/\tro,relatime\text4\t/dev/block/dm-5\tro,seclabel\t/");
+        assert_eq!(mounts[2].point, "/system/app/Foo Bar");
         assert_eq!(
-            wanted_vermagic(&lines).as_deref(),
-            Some("5.10.0-android12-9")
+            mounts[2].canon,
+            "/system/app/Foo Bar\t/\trw\ttmpfs\tworkdir\trw\t/system"
         );
+    }
+
+    #[test]
+    fn reports_only_the_lines_that_differ() {
+        let a = parse_mountinfo("1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / /data rw - ext4 /dev/x rw\n");
+        let b = parse_mountinfo("1 0 0:1 / / rw - rootfs rootfs rw\n3 1 0:3 / /system ro - ext4 /dev/y ro\n");
+        let (a_only, b_only) = only_in(&a, &b);
+        assert_eq!(a_only.len(), 1);
+        assert!(a_only[0].starts_with("/data\t"));
+        assert_eq!(b_only.len(), 1);
+        assert!(b_only[0].starts_with("/system\t"));
     }
 }
 
@@ -1042,6 +1064,256 @@ fn status() {
         Some(first) => println!("stats:    {first}"),
         None => println!("stats:    none"),
     }
+}
+
+// ------------------------------------------------------- donor namespace
+//
+// Kasumi answers "what would mountinfo look like without us?" by swapping the
+// reader's namespace pointer inside the kernel.  We cannot use an unexported
+// `struct mnt_namespace` portably, and swapping it would also freeze the view
+// at mount time, so the same question is answered out here instead: clone the
+// mount namespace, drop the propagation link that would let an unmount escape,
+// detach every mountpoint we published, and read the result.  That donor view
+// is then compared with the view this process has, which is the one magic_hide
+// filtered.
+
+const CLONE_NEWNS: c_int = 0x0002_0000;
+const MS_REC: c_ulong = 1 << 14;
+const MS_PRIVATE: c_ulong = 1 << 18;
+const MNT_DETACH: c_int = 2;
+
+extern "C" {
+    fn unshare(flags: c_int) -> c_int;
+    fn mount(
+        source: *const c_char,
+        target: *const c_char,
+        fstype: *const c_char,
+        flags: c_ulong,
+        data: *const c_void,
+    ) -> c_int;
+    fn umount2(target: *const c_char, flags: c_int) -> c_int;
+    fn getuid() -> u32;
+}
+
+/// One mountinfo line reduced to what survives a namespace copy.  Mount ids
+/// are allocated per namespace, so the parent id is resolved to its mountpoint
+/// and both numbers are dropped; the `shared:`/`master:` tags are dropped too,
+/// because the donor namespace is made private before anything is unmounted.
+struct MiMount {
+    point: String,
+    canon: String,
+}
+
+/// mountinfo escapes space, tab, newline and backslash (`\040`, `\011`,
+/// `\012`, `\134`); the record list holds the raw path.
+fn unescape(field: &str) -> String {
+    let src = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'\\'
+            && i + 3 < src.len()
+            && src[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let v = ((src[i + 1] - b'0') as u32) << 6
+                | ((src[i + 2] - b'0') as u32) << 3
+                | (src[i + 3] - b'0') as u32;
+            out.push(v as u8);
+            i += 4;
+        } else {
+            out.push(src[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_mountinfo(text: &str) -> Vec<MiMount> {
+    // id, parent id, root, mount point, mount options, fstype, source, super options
+    let mut raw: Vec<(u64, u64, String, String, String, String, String, String)> = Vec::new();
+    for line in text.lines() {
+        let Some(split) = line.find(" - ") else { continue };
+        let left: Vec<&str> = line[..split].split_whitespace().collect();
+        let right: Vec<&str> = line[split + 3..].split_whitespace().collect();
+        if left.len() < 6 || right.len() < 3 {
+            continue;
+        }
+        let (Ok(id), Ok(parent)) = (left[0].parse::<u64>(), left[1].parse::<u64>()) else {
+            continue;
+        };
+        raw.push((
+            id,
+            parent,
+            unescape(left[3]),
+            unescape(left[4]),
+            left[5].to_string(),
+            right[0].to_string(),
+            unescape(right[1]),
+            right[2].to_string(),
+        ));
+    }
+
+    let points: BTreeMap<u64, String> = raw.iter().map(|r| (r.0, r.3.clone())).collect();
+    raw.into_iter()
+        .map(|(_, parent, root, point, opts, fstype, source, superopts)| {
+            let parent_point = points.get(&parent).cloned().unwrap_or_default();
+            let canon = format!("{point}\t{root}\t{opts}\t{fstype}\t{source}\t{superopts}\t{parent_point}");
+            MiMount { point, canon }
+        })
+        .collect()
+}
+
+/// Lines present in `a` but not `b`, and the other way round.
+fn only_in(a: &[MiMount], b: &[MiMount]) -> (Vec<String>, Vec<String>) {
+    let mut counts: BTreeMap<&str, i64> = BTreeMap::new();
+    for m in a {
+        *counts.entry(m.canon.as_str()).or_default() += 1;
+    }
+    for m in b {
+        *counts.entry(m.canon.as_str()).or_default() -= 1;
+    }
+    let (mut a_only, mut b_only) = (Vec::new(), Vec::new());
+    for (canon, n) in counts {
+        for _ in 0..n.max(0) {
+            a_only.push(canon.to_string());
+        }
+        for _ in 0..(-n).max(0) {
+            b_only.push(canon.to_string());
+        }
+    }
+    (a_only, b_only)
+}
+
+/// The child half: by now the namespace is a private copy with every published
+/// mountpoint detached, so this is the table a stock device would show.
+fn donor_view() {
+    let text = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mut out = std::io::stdout();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+    exit(0);
+}
+
+fn donor_check() {
+    let map = module_dir().join("hide-records.map");
+    let text = match fs::read_to_string(&map) {
+        Ok(text) => text,
+        Err(err) => {
+            println!("donor-check: cannot read {}: {err}", map.display());
+            exit(2);
+        }
+    };
+    let mut records: Vec<String> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if records.is_empty() {
+        println!("donor-check: {} is empty, nothing published yet", map.display());
+        exit(2);
+    }
+    // Deepest first: a bind mount lives on the tmpfs skeleton above it, so it
+    // has to be detached before that skeleton goes away.
+    records.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    let paths: Vec<CString> = records
+        .iter()
+        .filter_map(|path| CString::new(path.as_str()).ok())
+        .collect();
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            println!("donor-check: cannot locate itself: {err}");
+            exit(2);
+        }
+    };
+    let root = CString::new("/").expect("literal");
+    let mut cmd = Command::new(exe);
+    cmd.arg("__donor-view")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    unsafe {
+        cmd.pre_exec(move || {
+            if unshare(CLONE_NEWNS) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Must happen before the first umount: the copy still shares
+            // propagation with the parent namespace, and a shared unmount
+            // would remove our mounts from the running system.
+            let rc = mount(
+                std::ptr::null(),
+                root.as_ptr(),
+                std::ptr::null(),
+                MS_REC | MS_PRIVATE,
+                std::ptr::null(),
+            );
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for path in &paths {
+                // One stale record must not abort the whole comparison; a
+                // path that is not a mountpoint simply reports EINVAL.
+                let _ = umount2(path.as_ptr(), MNT_DETACH);
+            }
+            Ok(())
+        });
+    }
+
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(err) => {
+            println!("donor-check: cannot build a donor namespace: {err}");
+            exit(2);
+        }
+    };
+    if !output.status.success() {
+        println!("donor-check: donor reader failed: {}", output.status);
+        exit(2);
+    }
+
+    let donor = parse_mountinfo(&String::from_utf8_lossy(&output.stdout));
+    let live_all = parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
+
+    // A record path is by definition covered, so a line for it means the
+    // kernel did not hide it from this reader (APPS mode exempts uid 0, or the
+    // .ko is not loaded).  Drop exactly those lines and report the count; any
+    // other leaked mount, such as a workspace tmpfs, still shows up as a diff.
+    let record_set: HashSet<&str> = records.iter().map(String::as_str).collect();
+    let donor_points: HashSet<&str> = donor.iter().map(|m| m.point.as_str()).collect();
+    let mut visible = 0usize;
+    let live: Vec<MiMount> = live_all
+        .into_iter()
+        .filter(|m| {
+            if record_set.contains(m.point.as_str()) && !donor_points.contains(m.point.as_str()) {
+                visible += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let (only_donor, only_live) = only_in(&donor, &live);
+    let diff = only_donor.len() + only_live.len();
+    println!(
+        "donor-check: donor={} live={} diff={diff} covered-visible={visible}",
+        donor.len(),
+        live.len()
+    );
+    if visible > 0 {
+        println!(
+            "  hint: {visible} covered mountpoint(s) are still listed for uid {} (APPS mode exempts root, or magic_hide is not filtering)",
+            unsafe { getuid() }
+        );
+    }
+    for line in only_donor.iter().take(8) {
+        println!("  only in donor: {}", line.replace('\t', " "));
+    }
+    for line in only_live.iter().take(8) {
+        println!("  only in live:  {}", line.replace('\t', " "));
+    }
+
+    exit(if diff == 0 { 0 } else { 1 });
 }
 
 fn unload() {

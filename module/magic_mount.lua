@@ -160,7 +160,7 @@ local function report()
 end
 
 function M.version()
-    return 7
+    return 8
 end
 
 function M.post_fs_data(superkey)
