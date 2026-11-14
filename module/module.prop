@@ -1,7 +1,7 @@
 id=magic_mount
 name=Magic Mount
-version=11
-versionCode=11
+version=12
+versionCode=12
 author=Admirepowered,5ec1cff
 description=Magic mount for metamodules, with kernel-level hiding of the result
 metamodule=1

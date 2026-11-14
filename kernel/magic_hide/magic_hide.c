@@ -204,6 +204,7 @@ struct mh_anchor {
 /* seq_file views: remember the buffer offset at function entry. */
 struct mh_seq_inst {
 	struct seq_file *m;
+	struct vfsmount *mnt; /* show_vfsmnt()/show_vfsstat(), for the root field */
 	size_t start;
 };
 
@@ -1414,9 +1415,51 @@ static bool mh_ws_path_n(const char *path, size_t n)
 	return false;
 }
 
-static bool mh_line_hidden(enum mh_kind kind, const char *buf, size_t len)
+/*
+ * Rebuild the mount-root string mountinfo prints: "/" followed by the path
+ * from the superblock root to the mount root.  /proc/mounts has no such
+ * column, but its hook receives the mount object.  Returns 0 when the walk
+ * does not reach the superblock root or the path does not fit.
+ */
+static size_t mh_mount_root(struct vfsmount *mnt, char *buf, size_t buflen)
+{
+	struct dentry *d, *root;
+	size_t len = 0;
+	unsigned int depth = 32;
+
+	if (!mnt || !mnt->mnt_root || !mnt->mnt_sb || !mnt->mnt_sb->s_root)
+		return 0;
+	d = mnt->mnt_root;
+	root = mnt->mnt_sb->s_root;
+	while (d != root) {
+		size_t nl;
+
+		if (!depth-- || IS_ROOT(d))
+			return 0;
+		nl = d->d_name.len;
+		if (len + nl + 1 >= buflen)
+			return 0;
+		/* Prepend "/name": the walk runs leaf -> superblock root. */
+		memmove(buf + nl + 1, buf, len);
+		buf[0] = '/';
+		memcpy(buf + 1, d->d_name.name, nl);
+		len += nl + 1;
+		d = READ_ONCE(d->d_parent);
+	}
+	if (!len) {
+		buf[0] = '/';
+		len = 1;
+	}
+	return len;
+}
+
+#define MH_ROOT_BUF 256
+
+static bool mh_line_hidden(enum mh_kind kind, const char *buf, size_t len,
+			   struct vfsmount *mnt)
 {
 	struct mh_line l;
+	char rootbuf[MH_ROOT_BUF];
 	bool ok;
 
 	switch (kind) {
@@ -1432,6 +1475,23 @@ static bool mh_line_hidden(enum mh_kind kind, const char *buf, size_t len)
 	}
 	if (!ok)
 		return false;
+
+	/*
+	 * /proc/mounts and /proc/mountstats have no root column, while
+	 * mountinfo does and one of the signatures below keys on it.  Without it
+	 * the same mount would be hidden from one file and listed by the other,
+	 * which is exactly the cross-view difference a detector looks for.  Both
+	 * show functions are handed the mount, so the string mountinfo prints can
+	 * be rebuilt here.
+	 */
+	if (kind == MH_K_VFSMNT || kind == MH_K_VFSSTAT) {
+		size_t rl = mh_mount_root(mnt, rootbuf, sizeof(rootbuf));
+
+		if (rl) {
+			l.root = rootbuf;
+			l.root_len = rl;
+		}
+	}
 
 	if (mh_ws_path_n(l.point, strlen(l.point)))
 		return true;
@@ -1540,6 +1600,8 @@ static int mh_seq_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 	struct mh_seq_inst *d = (struct mh_seq_inst *)ri->data;
 	struct seq_file *m = (struct seq_file *)MH_PARM1(regs);
 
+	d->mnt = NULL;
+
 	/*
 	 * /proc/kallsyms lists this module's own symbol names.  That is not a
 	 * mount decision, so it is hidden from every reader in every mode -
@@ -1569,6 +1631,9 @@ static int mh_seq_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 		return 1;
 
 	d->m = m;
+	/* show_vfsmnt()/show_vfsstat(): second argument is the mount. */
+	if (kind == MH_K_VFSMNT || kind == MH_K_VFSSTAT)
+		d->mnt = (struct vfsmount *)MH_PARM2(regs);
 	d->start = m->count;
 	return 0;
 }
@@ -1599,7 +1664,7 @@ static int mh_seq_ret(struct kretprobe_instance *ri, struct pt_regs *regs,
 	case MH_K_MOUNTINFO:
 	case MH_K_VFSMNT:
 	case MH_K_VFSSTAT:
-		if (mh_line_hidden(kind, m->buf + start, end - start))
+		if (mh_line_hidden(kind, m->buf + start, end - start, d->mnt))
 			m->count = start;
 		break;
 	case MH_K_KPROBES:

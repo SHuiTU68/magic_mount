@@ -471,6 +471,46 @@ check_cleanup() {
     fi
 }
 
+# /proc/self/mounts and /proc/self/mountinfo are two renderings of the same
+# mount namespace, so they have to list the same mountpoints.  A mount that
+# disappears from only one of them is a fingerprint: diffing the two files is
+# one of the cheapest ways to spot selective hiding.  Both files are
+# regenerated per read, so a difference is retried before it is reported.
+check_views() {
+    sec "mount views (mounts vs mountinfo)"
+
+    if [ ! -r /proc/self/mounts ] || [ ! -r /proc/self/mountinfo ]; then
+        skip "mount tables not readable"
+        return
+    fi
+
+    MV=$DIR/.mm_views_mounts
+    MI=$DIR/.mm_views_mountinfo
+    i=0
+    while [ "$i" -lt 3 ]; do
+        awk '{ print $2 }' /proc/self/mounts | sort >"$MV"
+        awk '{ print $5 }' /proc/self/mountinfo | sort >"$MI"
+        if [ "$(cat "$MV")" = "$(cat "$MI")" ]; then
+            ok "both views list the same $(wc -l <"$MV") mountpoints"
+            rm -f "$MV" "$MI"
+            return
+        fi
+        i=$((i + 1))
+        sleep 0.2 2>/dev/null || sleep 1
+    done
+
+    bad "mounts and mountinfo list different mountpoints"
+    printf '      mounts=%s line(s), mountinfo=%s line(s)\n' \
+        "$(wc -l <"$MV")" "$(wc -l <"$MI")"
+    only_mounts=$(grep -vxF -f "$MI" "$MV" 2>/dev/null | head -n 8)
+    only_info=$(grep -vxF -f "$MV" "$MI" 2>/dev/null | head -n 8)
+    [ -n "$only_mounts" ] && printf '%s\n' "$only_mounts" |
+        sed 's/^/      only in mounts: /'
+    [ -n "$only_info" ] && printf '%s\n' "$only_info" |
+        sed 's/^/      only in mountinfo: /'
+    rm -f "$MV" "$MI"
+}
+
 case "${1:-}" in
 --help | -h)
     usage
@@ -502,6 +542,7 @@ printf 'magic_mount self check\n'
 
 check_hide
 check_mount_table
+check_views
 check_donor
 check_overhead
 check_identity
