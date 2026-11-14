@@ -92,7 +92,7 @@ local function loader(action, log_file)
         -- the first attempt is the interesting one.
         redirect = (" >>'%s' 2>&1"):format(log_file)
     end
-    local env = ("MM_LKM_DIR='%s' "):format(lkdir)
+    local env = ("MM_LKM_DIR='%s' MM_MODDIR='%s' "):format(lkdir, moddir())
     local code = run(("%s'%s' %s%s"):format(env, bin, action, redirect))
 
     -- 127 is what sh returns when it cannot exec the file at all; 126 is a
@@ -208,6 +208,9 @@ function M.action()
         -- Older package without lkm/loader: report what we can from the shell.
         run(("cat '%s/mount-stats.txt' 2>/dev/null"):format(moddir()))
     end
+    -- Re-drain the hit table so an app that was used after boot (the reason a
+    -- user taps the module) shows up in hide-hits.log without a reboot.
+    report()
 end
 
 return M

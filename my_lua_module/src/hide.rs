@@ -370,7 +370,7 @@ impl MountTable {
         payload.send_mode(MH_CMD_HITS, 1, 0, 0);
         // The kernel names a hit bucket by the index of the record it matched,
         // so keep the same order to resolve an id back to a path later.
-        *RECORDS.lock().unwrap_or_else(|e| e.into_inner()) = published;
+        store_records(&published);
         log::info!("published {} mountpoints to magic_hide", entries.len());
     }
 
@@ -597,7 +597,40 @@ impl Hit {
 
 /// Publication order of the mountpoints last handed to the LKM; `mh_uhit.id`
 /// is an index into this list.
+///
+/// `publish()` runs in the loader's child process, while `report()` runs in the
+/// module's Lua process, so this cannot stay a process-local `static`: the
+/// mapping is written next to the module and read back by whoever drains the
+/// table.  Without it every bucket prints as `<record N>`.
 static RECORDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn store_records(paths: &[PathBuf]) {
+    let mut text = String::new();
+    for p in paths {
+        text.push_str(&p.to_string_lossy());
+        text.push('\n');
+    }
+    let dir = crate::moddir::path();
+    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::write(dir.join("hide-records.map"), text).is_err() {
+        log::warn!("cannot persist hide-records.map in {}", dir.display());
+    }
+    *RECORDS.lock().unwrap_or_else(|e| e.into_inner()) = paths.to_vec();
+}
+
+fn record_paths() -> Vec<PathBuf> {
+    if let Ok(text) = std::fs::read_to_string(crate::moddir::path().join("hide-records.map")) {
+        let paths: Vec<PathBuf> = text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+    RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 /// Drain the kernel's hit buckets.  `on` re-arms collection after the drain:
 /// the first call right after publishing starts it, the report call stops it.
@@ -608,7 +641,7 @@ pub fn hits(on: bool) -> Vec<Hit> {
     if !payload.send_mode(MH_CMD_HITS, u32::from(on), 0, 0) {
         return Vec::new();
     }
-    let records = RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let records = record_paths();
 
     let count = (payload.hdr().count as usize).min(MH_HIT_MAX);
     let buf = payload.buf_mut();
@@ -654,10 +687,10 @@ pub fn report() -> bool {
         policy = set_exempt(&exempt);
     }
 
-    // Drain what actually reached a covered mount during boot.  This also
-    // stops collection, so it has to happen after every hot lookup has had a
-    // chance and before the log is written.
-    let touched = hits(false);
+    // Drain what actually reached a covered mount during boot, then keep
+    // collecting: apps used after boot_completed (a font manager, for example)
+    // only show up in the next drain, which `action` can trigger.
+    let touched = hits(true);
     write_hits(dir, &touched, &exempt);
 
     // Arm once more so the status bits describe a registered probe, take the
@@ -692,10 +725,15 @@ pub fn report() -> bool {
             if policy { "" } else { " (not applied)" }
         ));
     }
-    // The loader writes why an insert failed; without it the log only says
-    // "not loaded" and the reason stays in a terminal nobody reads.
+    // The loader appends one block per load attempt, so only the newest block
+    // explains the current state; older boots would bury it.
     if let Ok(text) = std::fs::read_to_string(dir.join("lkm.log")) {
-        for line in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .rposition(|line| line.starts_with("  build cfg:"))
+            .unwrap_or_else(|| lines.len().saturating_sub(6));
+        for line in &lines[start..] {
             log.push_str(&format!("# lkm: {line}\n"));
         }
     }
@@ -711,7 +749,13 @@ pub fn report() -> bool {
             o.comm()
         ));
     }
-    let _ = std::fs::write(dir.join("hide-events.log"), log);
+    // `action` re-runs this after boot to refresh the hit table; by then the
+    // observer is already torn down and its boot-time drain would be replaced
+    // by an empty one.  Keep the snapshot that actually recorded callers.
+    let events_path = dir.join("hide-events.log");
+    if !sorted.is_empty() || !events_path.exists() {
+        let _ = std::fs::write(events_path, log);
+    }
 
     if !sorted.is_empty() {
         log::info!("magic_hide saw {} distinct callers", sorted.len());

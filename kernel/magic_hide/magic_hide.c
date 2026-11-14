@@ -382,6 +382,18 @@ static bool g_ft_armed;
 static struct kprobe g_ev_kp[4];
 static bool g_ev_live[4];
 
+/*
+ * Called once per published mount table (MH_CMD_RESET), not on every
+ * enable/disable.  Re-arming the probes must not touch the totals: the report
+ * path re-sends the addresses and re-enables, and a reset there made a boot
+ * with 28 recorded callers report "matched=false calls=0".
+ */
+static void mh_ev_reset(void)
+{
+	atomic_set(&g_ft_calls, 0);
+	atomic_set(&g_ft_matched, 0);
+}
+
 static void mh_ft_hit(unsigned long ip)
 {
 	u32 uid = (u32)current_fsuid().val;
@@ -486,6 +498,19 @@ static int mh_set_addrs(const mh_u64 *in, mh_u32 n)
 	for (i = 0; i < n; i++)
 		ips[i] = in[i];
 
+	/*
+	 * The module re-sends the same four addresses whenever it re-arms the
+	 * observer.  Tearing the probes down for an identical set would close and
+	 * reopen the drain window for no reason.
+	 */
+	if (n == 4 && mh_ft_have_params()) {
+		for (i = 0; i < 4; i++)
+			if (g_ft_ip[i] != (unsigned long)ips[i])
+				break;
+		if (i == 4)
+			return 0;
+	}
+
 	mh_ft_unregister();
 	for (i = 0; i < 4; i++)
 		g_ft_ip[i] = (unsigned long)ips[i];
@@ -499,16 +524,6 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 	u32 i, n = 0;
 
 	if (on) {
-		/*
-		 * Only a fresh start clears the counters.  The report path re-enables
-		 * an observer that has been collecting since post_mount, and wiping
-		 * the totals there made "calls=0" look like the probes never fired
-		 * while 27 slots were full.
-		 */
-		if (!atomic_read(&g_ev_on)) {
-			atomic_set(&g_ft_calls, 0);
-			atomic_set(&g_ft_matched, 0);
-		}
 		mh_ft_register();
 		atomic_set(&g_ev_on, 1);
 	} else {
@@ -553,6 +568,10 @@ static u32 mh_events_dump(struct mh_upayload *pl, bool on)
 	pl->hdr.mode = 0; /* observer not compiled in */
 	pl->hdr.reserved = 0;
 	return 0;
+}
+
+static void mh_ev_reset(void)
+{
 }
 
 static void mh_ft_unregister(void)
@@ -816,6 +835,7 @@ static void mh_records_reset(void)
 	/* Record ids restart at 0, so stale hit buckets would point at the
 	 * wrong path after a republish. */
 	mh_hit_clear();
+	mh_ev_reset();
 
 	synchronize_rcu();
 

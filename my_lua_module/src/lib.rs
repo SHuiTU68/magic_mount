@@ -113,6 +113,12 @@ pub unsafe extern "C" fn magic_mount_exec(source: *const std::os::raw::c_char) -
     if source.is_null() {
         return -1;
     }
+    // The loader runs the mount pass in a child process, so the library there
+    // never sees Lua's `configure()` call.  Passing MODDIR through the
+    // environment keeps state files (and hide-records.map) in the same place.
+    if let Ok(dir) = std::env::var("MM_MODDIR") {
+        moddir::set(&dir);
+    }
     let Ok(source) = (unsafe { std::ffi::CStr::from_ptr(source) }).to_str() else {
         return -1;
     };
