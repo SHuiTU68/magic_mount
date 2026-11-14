@@ -224,8 +224,27 @@ check_hide() {
         ok "/proc/modules does not list magic_hide"
     fi
 
+    # /sys/module is hidden by rewriting the kernfs readdir actor; the sysfs
+    # directory itself stays reachable, which is why the load check above works.
+    if [ -r /sys/module ] && ls /sys/module 2>/dev/null | grep -qx magic_hide; then
+        bad "/sys/module lists magic_hide"
+    else
+        ok "/sys/module does not list magic_hide"
+    fi
+
+    # s_show drops every "symbol [magic_hide]" line from /proc/kallsyms.
+    if [ -r /proc/kallsyms ]; then
+        if grep -q '\[magic_hide\]' /proc/kallsyms 2>/dev/null; then
+            bad "/proc/kallsyms still lists magic_hide symbols"
+        else
+            ok "/proc/kallsyms does not list magic_hide symbols"
+        fi
+    else
+        skip "/proc/kallsyms not readable"
+    fi
+
     if [ -r /sys/kernel/debug/kprobes/list ]; then
-        if grep -E 'vfs_statfs|vfs_getattr|show_mountinfo|show_vfsmnt|show_vfsstat|m_show|show_kprobe_addr' \
+        if grep -E 'vfs_statfs|vfs_getattr|show_mountinfo|show_vfsmnt|show_vfsstat|m_show|show_kprobe_addr|s_show|kernfs_fop_readdir' \
             /sys/kernel/debug/kprobes/list >/dev/null 2>&1; then
             bad "our kprobes are listed in debugfs"
         else

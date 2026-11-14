@@ -937,11 +937,13 @@ fn write_hits(dir: &Path, touched: &[Hit], exempt: &[u32], pairs: &[(u32, PathBu
     let _ = std::fs::write(dir.join("hide-hits.log"), log);
 
     // Suggest the narrowest rule that covers what was seen: `uid:path` keeps
-    // the rest of that uid hidden.  A single lookup is usually a probe that
-    // should stay hidden, and system uids must keep the faked view.
+    // the rest of that uid hidden.  A handful of lookups is just an app
+    // loading a replaced resource (SystemUI does that for every theme
+    // overlay), so only a genuinely repeated pattern is worth a rule.
+    const SUGGEST_MIN: u64 = 8;
     let mut sugg: Vec<(u32, PathBuf, u64)> = Vec::new();
     for h in &sorted {
-        if h.uid < 10000 || h.uid == u32::MAX || h.count < 3 {
+        if h.uid < 10000 || h.uid == u32::MAX || h.count < SUGGEST_MIN {
             continue;
         }
         if exempt.contains(&h.uid)
@@ -962,7 +964,7 @@ fn write_hits(dir: &Path, touched: &[Hit], exempt: &[u32], pairs: &[(u32, PathBu
     sugg.sort_by(|a, b| b.2.cmp(&a.2));
 
     let mut draft = String::from(
-        "# magic_hide suggestion: app uids seen on covered mounts (>= 3 times).\n\
+        "# magic_hide suggestion: app uids seen on covered mounts (>= 8 times).\n\
          # Copy a line into hide-exempt-uids; `uid:path` keeps the rest of that uid hidden.\n",
     );
     for (uid, path, count) in &sugg {

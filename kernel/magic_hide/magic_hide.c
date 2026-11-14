@@ -11,8 +11,8 @@
  *      flags and block accounting on a skeleton directory;
  *   3. stat()/statx()/fstat() report the tmpfs or module filesystem st_dev and
  *      f2fs inode numbers on entries the skeleton owns;
- *   4. the module and its probes are listed in /proc/modules and
- *      /sys/kernel/debug/kprobes/list;
+ *   4. the module and its probes are listed in /proc/modules,
+ *      /sys/kernel/debug/kprobes/list, /sys/module and /proc/kallsyms;
  *   5. every caller gets the same answer, including a process that still has
  *      to use the real partition;
  *   6. getxattr("security.selinux") reports the workspace filesystem's label
@@ -49,7 +49,12 @@
  *     "symbol+0x0" token is one of our probe points.
  *
  * Point 4's /proc/modules half is the m_show hook; the debugfs kprobes list
- * half is show_kprobe_addr.  Both are hidden from the same uids as points 1-3.
+ * half is show_kprobe_addr.  The remaining identifiers are removed as well:
+ * s_show drops the module's symbol lines from /proc/kallsyms, and
+ * kernfs_fop_readdir swaps the directory actor for the duration of one
+ * /sys/module listing so the kobject name never reaches userspace.  Both are
+ * unconditional - they conceal the module, not a mount - and both are
+ * optional, so a kernel without those symbols still loads the rest.
  *
  * Point 6 is a kretprobe on vfs_getxattr(): userspace samples the context of
  * every target before the mount exists and ships the distinct strings with the
@@ -176,6 +181,7 @@ enum mh_kind {
 	MH_K_GETATTR,
 	MH_K_MODULES,
 	MH_K_KPROBES,
+	MH_K_KALLSYMS,
 };
 
 struct mh_anchor {
@@ -1460,7 +1466,8 @@ static bool mh_probe_self_line(const char *s, size_t n)
 {
 	static const char *const syms[] = {
 		"vfs_getattr", "vfs_statfs", "show_mountinfo", "show_vfsmnt",
-		"show_vfsstat", "m_show", "show_kprobe_addr",
+		"show_vfsstat", "m_show", "show_kprobe_addr", "s_show",
+		"kernfs_fop_readdir",
 	};
 	unsigned int i;
 
@@ -1514,11 +1521,38 @@ static void mh_filter_lines(struct seq_file *m, size_t start, size_t end)
 /* kretprobe handlers: seq_file views                                  */
 /* ------------------------------------------------------------------ */
 
+/* Substring test for a fixed token, used by the kallsyms filter. */
+static bool mh_has_token(const char *s, size_t n, const char *tok)
+{
+	size_t tl = strlen(tok), i;
+
+	if (n < tl)
+		return false;
+	for (i = 0; i + tl <= n; i++)
+		if (!memcmp(s + i, tok, tl))
+			return true;
+	return false;
+}
+
 static int mh_seq_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 			enum mh_kind kind)
 {
 	struct mh_seq_inst *d = (struct mh_seq_inst *)ri->data;
 	struct seq_file *m = (struct seq_file *)MH_PARM1(regs);
+
+	/*
+	 * /proc/kallsyms lists this module's own symbol names.  That is not a
+	 * mount decision, so it is hidden from every reader in every mode -
+	 * including root, whose fsuid the APPS policy would otherwise let
+	 * through.
+	 */
+	if (kind == MH_K_KALLSYMS) {
+		if (!m || !m->buf)
+			return 1;
+		d->m = m;
+		d->start = m->count;
+		return 0;
+	}
 
 	if (!mh_hide_for_current())
 		return 1;
@@ -1571,9 +1605,142 @@ static int mh_seq_ret(struct kretprobe_instance *ri, struct pt_regs *regs,
 	case MH_K_KPROBES:
 		mh_filter_lines(m, start, end);
 		break;
+	case MH_K_KALLSYMS:
+		if (mh_has_token(m->buf + start, end - start, "[magic_hide]"))
+			m->count = start;
+		break;
 	default:
 		break;
 	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* kretprobe handlers: /sys/module listing                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * /sys/module is a kernfs directory, so the entry name is emitted through
+ * dir_context->actor, not a seq_file buffer.  Swap the actor for the duration
+ * of one readdir and drop the one name, forwarding everything else.
+ */
+struct mh_dir_inst {
+	struct dir_context *ctx;
+	filldir_t orig;
+	u32 slot;
+};
+
+#define MH_DIR_SLOTS 4
+
+static struct {
+	struct dir_context *ctx;
+	filldir_t orig;
+	bool used;
+} g_dir_slots[MH_DIR_SLOTS];
+/*
+ * Every /sys/module listing uses the same VFS actor (filldir64), so the last
+ * one seen also serves as the fallback if all slots are busy.
+ */
+static filldir_t g_dir_orig;
+static DEFINE_SPINLOCK(g_dir_lock);
+
+/* filldir_t returns int up to 5.15 and bool from 6.1 on. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+#define MH_FILLDIR_RET bool
+#else
+#define MH_FILLDIR_RET int
+#endif
+
+static MH_FILLDIR_RET mh_dir_actor(struct dir_context *ctx, const char *name,
+				   int namlen, loff_t off, u64 ino,
+				   unsigned int d_type)
+{
+	static const char self[] = "magic_hide";
+	filldir_t orig = NULL;
+	unsigned long flags;
+	unsigned int i;
+
+	/* Return 0 ("emitted") without emitting: the name never reaches user. */
+	if (namlen == (int)sizeof(self) - 1 &&
+	    !memcmp(name, self, sizeof(self) - 1))
+		return 0;
+
+	spin_lock_irqsave(&g_dir_lock, flags);
+	for (i = 0; i < MH_DIR_SLOTS; i++) {
+		if (g_dir_slots[i].used && g_dir_slots[i].ctx == ctx) {
+			orig = g_dir_slots[i].orig;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_dir_lock, flags);
+	if (!orig)
+		orig = READ_ONCE(g_dir_orig);
+
+	/* No actor at all: keep iterating rather than aborting the listing. */
+	return orig ? orig(ctx, name, namlen, off, ino, d_type) : 0;
+}
+
+static int mh_dir_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct mh_dir_inst *d = (struct mh_dir_inst *)ri->data;
+	struct file *file = (struct file *)MH_PARM1(regs);
+	struct dir_context *ctx = (struct dir_context *)MH_PARM2(regs);
+	struct dentry *dir;
+	unsigned long flags;
+	unsigned int i;
+
+	d->ctx = NULL;
+	if (!file || !ctx || !ctx->actor || !file->f_path.mnt)
+		return 1;
+	dir = file->f_path.dentry;
+	if (!dir || dir->d_name.len != 6 ||
+	    memcmp(dir->d_name.name, "module", 6))
+		return 1;
+	/* Top-level "module" of the sysfs mount: /sys/module. */
+	if (dir->d_parent != file->f_path.mnt->mnt_root &&
+	    (dir->d_parent->d_name.len != 3 ||
+	     memcmp(dir->d_parent->d_name.name, "sys", 3)))
+		return 1;
+
+	spin_lock_irqsave(&g_dir_lock, flags);
+	for (i = 0; i < MH_DIR_SLOTS; i++)
+		if (!g_dir_slots[i].used)
+			break;
+	if (i == MH_DIR_SLOTS) {
+		spin_unlock_irqrestore(&g_dir_lock, flags);
+		return 1;
+	}
+	g_dir_slots[i].used = true;
+	g_dir_slots[i].ctx = ctx;
+	g_dir_slots[i].orig = ctx->actor;
+	spin_unlock_irqrestore(&g_dir_lock, flags);
+
+	WRITE_ONCE(g_dir_orig, ctx->actor);
+	d->ctx = ctx;
+	d->orig = ctx->actor;
+	d->slot = i;
+	WRITE_ONCE(ctx->actor, mh_dir_actor);
+	return 0;
+}
+
+static int mh_dir_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct mh_dir_inst *d = (struct mh_dir_inst *)ri->data;
+	unsigned long flags;
+
+	(void)regs;
+	if (!d->ctx)
+		return 0;
+	if (READ_ONCE(d->ctx->actor) == mh_dir_actor)
+		WRITE_ONCE(d->ctx->actor, d->orig);
+
+	spin_lock_irqsave(&g_dir_lock, flags);
+	if (d->slot < MH_DIR_SLOTS) {
+		g_dir_slots[d->slot].used = false;
+		g_dir_slots[d->slot].ctx = NULL;
+		g_dir_slots[d->slot].orig = NULL;
+	}
+	spin_unlock_irqrestore(&g_dir_lock, flags);
 	return 0;
 }
 
@@ -1677,8 +1844,8 @@ static int mh_hot_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 		(MH_REC_F_DEV | MH_REC_F_INO | MH_REC_F_DSIZE);
 
 	/*
-	 * Fast path: nothing published, or the caller is allowed to see the
-	 * real state.  Returning 1 skips the return trampoline entirely.
+	 * Fast path: nothing published.  Returning 1 skips the return trampoline
+	 * entirely.
 	 */
 	if (kind == MH_K_STATFS) {
 		if (!atomic_read(&g_hot_type) && !atomic_read(&g_hot_mflags) &&
@@ -1687,14 +1854,28 @@ static int mh_hot_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 	} else if (!atomic_read(&g_hot_dev)) {
 		return 1;
 	}
-	if (!mh_hide_for_current())
-		return 1;
 	if (!path || !path->mnt || !out)
 		return 1;
 
 	rcu_read_lock();
 	a = mh_hot_lookup(path->mnt);
-	if (a && (a->flags & need)) {
+	if (!a || !(a->flags & need)) {
+		rcu_read_unlock();
+		return 1;
+	}
+
+	/*
+	 * The policy check sits after the anchor lookup on purpose.  Every
+	 * stat()/statfs() in the system reaches this handler, while only the
+	 * ones that resolved an anchor need the caller's uid decision; the
+	 * lookup itself is a couple of hash probes with no policy work.
+	 */
+	if (!mh_hide_for_current()) {
+		rcu_read_unlock();
+		return 1;
+	}
+
+	{
 		u32 flags = a->flags & need;
 
 		mh_hit_record(a->id);
@@ -1721,11 +1902,9 @@ static int mh_hot_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 		d->m_flags = a->m_flags;
 		d->st = a->st;
 		d->ks = a->ks;
-		rcu_read_unlock();
-		return 0;
 	}
 	rcu_read_unlock();
-	return 1;
+	return 0;
 }
 
 static int mh_hot_ret(struct kretprobe_instance *ri, struct pt_regs *regs,
@@ -1813,6 +1992,7 @@ MH_SEQ_FNS(mh_vfsmnt, MH_K_VFSMNT)
 MH_SEQ_FNS(mh_vfsstat, MH_K_VFSSTAT)
 MH_SEQ_FNS(mh_modules, MH_K_MODULES)
 MH_SEQ_FNS(mh_kprobes, MH_K_KPROBES)
+MH_SEQ_FNS(mh_kallsyms, MH_K_KALLSYMS)
 MH_HOT_FNS(mh_statfs, MH_K_STATFS)
 MH_HOT_FNS(mh_getattr, MH_K_GETATTR)
 
@@ -1840,16 +2020,27 @@ static struct kretprobe g_rp_vfsmnt = MH_SEQ_RP("show_vfsmnt", mh_vfsmnt);
 static struct kretprobe g_rp_vfsstat = MH_SEQ_RP("show_vfsstat", mh_vfsstat);
 static struct kretprobe g_rp_modules = MH_SEQ_RP("m_show", mh_modules);
 static struct kretprobe g_rp_kprobes = MH_SEQ_RP("show_kprobe_addr", mh_kprobes);
+static struct kretprobe g_rp_kallsyms = MH_SEQ_RP("s_show", mh_kallsyms);
+
+/* Optional: hides /sys/module's entry for this module. */
+static struct kretprobe g_rp_readdir = {
+	.kp = { .symbol_name = "kernfs_fop_readdir" },
+	.entry_handler = mh_dir_entry,
+	.handler = mh_dir_ret,
+	.data_size = sizeof(struct mh_dir_inst),
+	.maxactive = 8,
+};
 
 /*
  * vfs_getattr() is on the hottest path in the system; give it a larger
  * instance pool so nested/parallel calls do not silently lose the rewrite,
- * while the entry handler keeps the miss path allocation-free.
+ * while the entry handler keeps the miss path allocation-free.  The same
+ * applies to vfs_statfs(): a package scan has many threads in it at once.
  */
 static struct kretprobe g_rp_statfs =
-	MH_HOT_RP("vfs_statfs", mh_statfs, 32);
+	MH_HOT_RP("vfs_statfs", mh_statfs, 64);
 static struct kretprobe g_rp_getattr =
-	MH_HOT_RP("vfs_getattr", mh_getattr, 128);
+	MH_HOT_RP("vfs_getattr", mh_getattr, 256);
 
 static struct kretprobe g_rp_xattr = {
 	.kp = { .symbol_name = "vfs_getxattr" },
@@ -1864,6 +2055,8 @@ static bool g_reg_vfsmnt;
 static bool g_reg_vfsstat;
 static bool g_reg_modules;
 static bool g_reg_kprobes;
+static bool g_reg_kallsyms;
+static bool g_reg_readdir;
 static bool g_reg_statfs;
 static bool g_reg_getattr;
 static bool g_reg_xattr;
@@ -2145,6 +2338,24 @@ static int __init magic_hide_init(void)
 	mh_seq_probe_register(&g_rp_modules, &g_reg_modules, "m_show");
 	mh_seq_probe_register(&g_rp_kprobes, &g_reg_kprobes,
 			      "show_kprobe_addr");
+	/*
+	 * Cosmetic: drops this module's own names from /proc/kallsyms.  A
+	 * kernel built without CONFIG_KALLSYMS has no s_show, and that is not
+	 * a reason to refuse to load.
+	 */
+	if (register_kretprobe(&g_rp_kallsyms))
+		pr_debug("cannot probe s_show\n");
+	else
+		g_reg_kallsyms = true;
+	/*
+	 * Same idea for /sys/module: a kernel whose kernfs readdir entry point
+	 * is not named `kernfs_fop_readdir` simply keeps the sysfs directory
+	 * visible.  Unconditional, like the /proc/modules and kallsyms hooks.
+	 */
+	if (register_kretprobe(&g_rp_readdir))
+		pr_debug("cannot probe kernfs_fop_readdir\n");
+	else
+		g_reg_readdir = true;
 
 	if (!g_reg_mountinfo && !g_reg_vfsmnt && !g_reg_vfsstat &&
 	    !g_reg_modules && !g_reg_kprobes) {
@@ -2155,9 +2366,10 @@ static int __init magic_hide_init(void)
 		pr_err("no hook could be installed\n");
 		return -ENOENT;
 	}
-	pr_info("loaded: mountinfo=%d vfsmnt=%d vfsstat=%d modules=%d kprobes=%d mode=%d ftrace=%d params=%d\n",
+	pr_info("loaded: mountinfo=%d vfsmnt=%d vfsstat=%d modules=%d kprobes=%d kallsyms=%d readdir=%d mode=%d ftrace=%d params=%d\n",
 		g_reg_mountinfo, g_reg_vfsmnt, g_reg_vfsstat, g_reg_modules,
-		g_reg_kprobes, (int)g_mode, MH_HAVE_FTRACE, mh_ft_have_params());
+		g_reg_kprobes, g_reg_kallsyms, g_reg_readdir, (int)g_mode,
+		MH_HAVE_FTRACE, mh_ft_have_params());
 	return 0;
 }
 
@@ -2175,6 +2387,10 @@ static void __exit magic_hide_exit(void)
 	/* The probe on its own show function goes last. */
 	if (g_reg_kprobes)
 		unregister_kretprobe(&g_rp_kprobes);
+	if (g_reg_kallsyms)
+		unregister_kretprobe(&g_rp_kallsyms);
+	if (g_reg_readdir)
+		unregister_kretprobe(&g_rp_readdir);
 	if (g_reg_modules)
 		unregister_kretprobe(&g_rp_modules);
 	if (g_reg_mountinfo)
