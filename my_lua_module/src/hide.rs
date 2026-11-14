@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MH_PAGE_SIZE: usize = 4096;
 const MH_PAYLOAD_MAGIC: u32 = 0x4d48_5359; // "MHSY"
-const MH_PAYLOAD_VERSION: u32 = 6; // 6: HITS (per-uid hit buckets)
+const MH_PAYLOAD_VERSION: u32 = 7; // 7: POLICY carries (uid, record) pairs
 const MH_PATH_MAX: usize = 512;
 const MH_BUF_MAX: usize = MH_PAGE_SIZE - std::mem::size_of::<Uhdr>();
 
@@ -43,6 +43,11 @@ const MH_CMD_POLICY: u32 = 5;
 const MH_CMD_EVENTS: u32 = 6;
 const MH_CMD_CONFIG: u32 = 7;
 const MH_CMD_HITS: u32 = 8;
+
+/// Whole-uid exemption, as opposed to one record id.
+const MH_EXEMPT_ANY: u32 = u32::MAX;
+/// Kernel side cap for one policy update (`MH_POLICY_MAX`).
+const MH_POLICY_MAX: usize = 256;
 
 const MH_MODE_ALL: u32 = 1;
 
@@ -395,6 +400,7 @@ pub fn refresh() -> bool {
 }
 
 const MH_EV_MAX: usize = 64;
+/// Kernel side cap for the whole-uid list (`MH_EXEMPT_MAX`).
 const MH_EXEMPT_MAX: usize = 64;
 const MH_COMM_LEN: usize = 16;
 
@@ -438,27 +444,23 @@ impl Observer {
     }
 }
 
-/// Processes that must keep seeing the real mount table.  An empty slice clears
-/// the set, which restores the default of hiding from everyone.
-pub fn set_exempt(uids: &[u32]) -> bool {
-    if uids.len() > MH_EXEMPT_MAX {
-        return false;
-    }
+/// Replace the exemption policy.  Each entry is `(uid, record)`; `record`
+/// `MH_EXEMPT_ANY` exempts the whole uid.  An empty slice clears the policy,
+/// which restores the default of hiding from everyone.
+pub fn set_policy(entries: &[(u32, u32)]) -> bool {
+    let entries = &entries[..entries.len().min(MH_POLICY_MAX)];
     let Some(mut payload) = Payload::new() else {
         return false;
     };
     {
         let buf = payload.buf_mut();
-        for (i, uid) in uids.iter().enumerate() {
-            let at = i * std::mem::size_of::<u32>();
+        for (i, (uid, id)) in entries.iter().enumerate() {
+            let at = i * 8;
             buf[at..at + 4].copy_from_slice(&uid.to_ne_bytes());
+            buf[at + 4..at + 8].copy_from_slice(&id.to_ne_bytes());
         }
     }
-    payload.send(
-        MH_CMD_POLICY,
-        uids.len() as u32,
-        (uids.len() * std::mem::size_of::<u32>()) as u32,
-    )
+    payload.send(MH_CMD_POLICY, entries.len() as u32, (entries.len() * 8) as u32)
 }
 
 /// Result of one MH_CMD_EVENTS round trip, including why it may be empty.
@@ -667,31 +669,101 @@ pub fn hits(on: bool) -> Vec<Hit> {
         .collect()
 }
 
-/// Drain the observer table, apply the exemption list from the module directory
-/// and keep a readable summary.  Called once the boot is over: everything that
-/// inspects the mount table has had its chance by then.
+/// Expand `10153` or `10000-10999` into concrete uids.  Ranges are bounded so
+/// a typo cannot balloon the policy past the kernel's 256 entry cap.
+fn expand_uids(spec: &str) -> Option<Vec<u32>> {
+    if let Some((lo, hi)) = spec.split_once('-') {
+        let lo: u32 = lo.trim().parse().ok()?;
+        let hi: u32 = hi.trim().parse().ok()?;
+        if lo > hi || hi - lo > 1024 {
+            return None;
+        }
+        Some((lo..=hi).collect())
+    } else {
+        spec.parse().ok().map(|uid| vec![uid])
+    }
+}
+
+/// Published record ids whose mountpoint is `want` or lies below it.
+fn ids_for_path(records: &[PathBuf], want: &Path) -> Vec<u32> {
+    records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, path)| path.starts_with(want).then_some(i as u32))
+        .collect()
+}
+
+/// Drain the observer table, apply the exemption rules from the module
+/// directory and keep a readable summary.  Called once the boot is over:
+/// everything that inspects the mount table has had its chance by then.
 pub fn report() -> bool {
     let dir = crate::moddir::path();
     let dir = dir.as_path();
     let mut policy = false;
-    let mut exempt_n = 0usize;
     let mut exempt: Vec<u32> = Vec::new();
+    let mut pairs: Vec<(u32, PathBuf)> = Vec::new();
+    let mut bad = 0usize;
 
     if let Ok(text) = std::fs::read_to_string(dir.join("hide-exempt-uids")) {
-        exempt = text
-            .lines()
-            .filter_map(|line| line.split('#').next())
-            .filter_map(|line| line.trim().parse().ok())
-            .collect();
-        exempt_n = exempt.len();
-        policy = set_exempt(&exempt);
+        let records = record_paths();
+        let mut entries: Vec<(u32, u32)> = Vec::new();
+
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            // `10153` exempts the whole uid; `10153:/system/fonts` exempts
+            // only the published mounts below that path.
+            let (spec, path) = match line.split_once(':') {
+                Some((uid, path)) => (uid.trim(), Some(Path::new(path.trim()))),
+                None => (line, None),
+            };
+            let Some(uids) = expand_uids(spec) else {
+                bad += 1;
+                continue;
+            };
+            for uid in uids {
+                if entries.len() >= MH_POLICY_MAX {
+                    bad += 1;
+                    break;
+                }
+                match path {
+                    None => {
+                        if exempt.len() >= MH_EXEMPT_MAX {
+                            bad += 1;
+                            continue;
+                        }
+                        exempt.push(uid);
+                        entries.push((uid, MH_EXEMPT_ANY));
+                    }
+                    Some(path) => {
+                        let ids = ids_for_path(&records, path);
+                        if ids.is_empty() {
+                            // The path is not covered, or the map is missing:
+                            // dropping it is safer than exempting everything.
+                            bad += 1;
+                            continue;
+                        }
+                        for id in ids {
+                            entries.push((uid, id));
+                            pairs.push((uid, path.to_path_buf()));
+                        }
+                    }
+                }
+            }
+        }
+
+        entries.sort_unstable();
+        entries.dedup();
+        policy = set_policy(&entries);
     }
 
     // Drain what actually reached a covered mount during boot, then keep
     // collecting: apps used after boot_completed (a font manager, for example)
     // only show up in the next drain, which `action` can trigger.
     let touched = hits(true);
-    write_hits(dir, &touched, &exempt);
+    write_hits(dir, &touched, &exempt, &pairs);
 
     // Arm once more so the status bits describe a registered probe, take the
     // drain, then tear the trampoline down for good.
@@ -720,10 +792,20 @@ pub fn report() -> bool {
             seen.events.len(),
         ));
         log.push_str(&format!(
-            "# policy: {} exempt uid(s){}\n",
-            exempt_n,
-            if policy { "" } else { " (not applied)" }
+            "# policy: {} uid rule(s), {} path rule(s){}",
+            exempt.len(),
+            pairs.len(),
+            if policy {
+                if bad > 0 {
+                    format!(", {bad} bad line(s)")
+                } else {
+                    String::new()
+                }
+            } else {
+                " (not applied)".to_string()
+            }
         ));
+        log.push('\n');
     }
     // The loader appends one block per load attempt, so only the newest block
     // explains the current state; older boots would bury it.
@@ -767,7 +849,7 @@ pub fn report() -> bool {
 /// covered mount into a *suggestion*.  The exemption list is never rewritten
 /// here: the operator copies the lines they trust, so a mis-detection cannot
 /// silently un-hide a partition for an app.
-fn write_hits(dir: &Path, touched: &[Hit], exempt: &[u32]) {
+fn write_hits(dir: &Path, touched: &[Hit], exempt: &[u32], pairs: &[(u32, PathBuf)]) {
     let mut sorted = touched.to_vec();
     sorted.sort_by(|a, b| b.count.cmp(&a.count));
 
@@ -783,31 +865,41 @@ fn write_hits(dir: &Path, touched: &[Hit], exempt: &[u32]) {
     }
     let _ = std::fs::write(dir.join("hide-hits.log"), log);
 
-    // Only uids that clearly belong to apps and were seen more than once are
-    // worth suggesting: a single lookup is usually a probe that should stay
-    // hidden, while uid 0 / system uids must keep the faked view.
-    let mut sugg: Vec<(u32, u64)> = Vec::new();
+    // Suggest the narrowest rule that covers what was seen: `uid:path` keeps
+    // the rest of that uid hidden.  A single lookup is usually a probe that
+    // should stay hidden, and system uids must keep the faked view.
+    let mut sugg: Vec<(u32, PathBuf, u64)> = Vec::new();
     for h in &sorted {
-        if h.uid < 10000 || h.uid == u32::MAX || exempt.contains(&h.uid) || h.count < 3 {
+        if h.uid < 10000 || h.uid == u32::MAX || h.count < 3 {
             continue;
         }
-        match sugg.iter_mut().find(|(uid, _)| *uid == h.uid) {
-            Some((_, count)) => *count += h.count,
-            None => sugg.push((h.uid, h.count)),
+        if exempt.contains(&h.uid)
+            || pairs
+                .iter()
+                .any(|(uid, path)| *uid == h.uid && h.path.starts_with(path))
+        {
+            continue;
+        }
+        match sugg
+            .iter_mut()
+            .find(|(uid, path, _)| *uid == h.uid && *path == h.path)
+        {
+            Some((_, _, count)) => *count += h.count,
+            None => sugg.push((h.uid, h.path.clone(), h.count)),
         }
     }
-    sugg.sort_by(|a, b| b.1.cmp(&a.1));
+    sugg.sort_by(|a, b| b.2.cmp(&a.2));
 
     let mut draft = String::from(
         "# magic_hide suggestion: app uids seen on covered mounts (>= 3 times).\n\
-         # Copy a line into hide-exempt-uids to stop hiding from that uid; nothing is applied automatically.\n",
+         # Copy a line into hide-exempt-uids; `uid:path` keeps the rest of that uid hidden.\n",
     );
-    for (uid, count) in &sugg {
-        draft.push_str(&format!("{uid} # seen {count} times\n"));
+    for (uid, path, count) in &sugg {
+        draft.push_str(&format!("{uid}:{} # seen {count} times\n", path.display()));
     }
     let _ = std::fs::write(dir.join("hide-exempt-uids.suggested"), draft);
     if !sugg.is_empty() {
-        log::info!("magic_hide hit table suggests {} exempt uid(s)", sugg.len());
+        log::info!("magic_hide hit table suggests {} exempt rule(s)", sugg.len());
     }
 }
 

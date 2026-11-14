@@ -30,7 +30,7 @@ typedef int32_t  mh_s32;
 
 #define MH_PAGE_SIZE        4096u
 #define MH_PAYLOAD_MAGIC    0x4d485359u /* "MHSY" */
-#define MH_PAYLOAD_VERSION  6u /* 6: HITS (per-uid hit buckets) */
+#define MH_PAYLOAD_VERSION  7u /* 7: POLICY carries (uid, record) pairs */
 #define MH_PATH_MAX         512
 
 /* Key type used by the LKM; add_key() is cancelled right after it runs. */
@@ -43,7 +43,7 @@ enum mh_cmd {
 	MH_CMD_MODE  = 2, /* change the per-uid visibility policy           */
 	MH_CMD_OFF   = 3, /* RESET + MH_MODE_OFF                            */
 	MH_CMD_REFRESH = 4, /* re-resolve paths, keep the published identity */
-	MH_CMD_POLICY = 5, /* replace the exempt uid set (process-level)     */
+	MH_CMD_POLICY = 5, /* replace the exempt (uid, record) policy    */
 	MH_CMD_EVENTS = 6, /* dump observed syscall callers, then clear      */
 	MH_CMD_CONFIG = 7, /* deliver the four ftrace addresses (u64[])      */
 	MH_CMD_HITS = 8,   /* dump who touched covered mounts, then clear    */
@@ -122,6 +122,21 @@ struct mh_uhit {
 	mh_u32 id;
 	mh_u64 count;
 	mh_u8 comm[MH_COMM_LEN];
+};
+
+/*
+ * One exemption: a uid, optionally limited to a single published record.
+ * id == MH_EXEMPT_ANY exempts the whole uid (the old behaviour); any other
+ * value exempts that uid only for the mount whose publish index it is, so a
+ * font manager can see /system/fonts natively while the rest of the tree stays
+ * hidden.  Entries are expanded from hide-exempt-uids by the module.
+ */
+#define MH_POLICY_MAX 256
+#define MH_EXEMPT_ANY 0xffffffffu
+
+struct mh_upolicy {
+	mh_u32 uid;
+	mh_u32 id;
 };
 
 /*

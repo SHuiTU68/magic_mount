@@ -336,7 +336,10 @@ check_hits() {
     s=$d/hide-exempt-uids.suggested
     if [ -r "$s" ]; then
         m=$(grep -vc '^#' "$s" 2>/dev/null)
-        info "${m:-0} exempt uid(s) suggested (not applied)"
+        info "${m:-0} exemption rule(s) suggested (not applied)"
+        grep -v '^#' "$s" 2>/dev/null | head -5 | while read -r rule rest; do
+            printf '      %s\n' "$rule"
+        done
     fi
 }
 

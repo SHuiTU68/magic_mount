@@ -243,10 +243,17 @@ static atomic_t g_anchor_count = ATOMIC_INIT(0);
  */
 #define MH_EXEMPT_MAX 64
 
+struct mh_uidpair {
+	u32 uid;
+	u32 id;
+};
+
 struct mh_uidset {
 	struct rcu_head rcu;
-	u32 n;
+	u32 n;					/* whole-uid exemptions */
 	u32 uid[MH_EXEMPT_MAX];
+	u32 np;					/* (uid, record) exemptions */
+	struct mh_uidpair pair[MH_POLICY_MAX];
 };
 
 static struct mh_uidset __rcu *g_exempt;
@@ -278,32 +285,90 @@ static bool mh_uid_exempt(u32 uid)
 	return hit;
 }
 
+/*
+ * Per-mount exemption: this caller keeps the native view of one covered mount
+ * while every other path stays hidden.  Being a positive match (it is only
+ * asked after the hot lookup already resolved an anchor), it does not add a
+ * second lookup to unrelated stat calls.
+ */
+static bool mh_anchor_exempt(u32 id)
+{
+	struct mh_uidset *set;
+	u64 key;
+	u32 lo = 0, hi;
+	bool hit = false;
+
+	key = ((u64)(u32)current_fsuid().val << 32) | id;
+	rcu_read_lock();
+	set = rcu_dereference(g_exempt);
+	if (set && set->np) {
+		hi = set->np;
+		while (lo < hi) {
+			u32 mid = lo + (hi - lo) / 2;
+			u64 k = ((u64)set->pair[mid].uid << 32) | set->pair[mid].id;
+
+			if (k == key) {
+				hit = true;
+				break;
+			}
+			if (k < key)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+	}
+	rcu_read_unlock();
+	return hit;
+}
+
 /* Called with g_mutex held. */
-static int mh_set_exempt(const u32 *uids, u32 n)
+static int mh_set_policy(const struct mh_upolicy *in, u32 n)
 {
 	struct mh_uidset *set, *old;
-	u32 i, j;
+	u32 i, j, nu = 0, np = 0;
 
-	if (n > MH_EXEMPT_MAX)
+	if (n > MH_POLICY_MAX)
 		return -EINVAL;
 
-	set = NULL;
-	if (n) {
-		set = kzalloc(sizeof(*set), GFP_KERNEL);
-		if (!set)
-			return -ENOMEM;
-		memcpy(set->uid, uids, n * sizeof(u32));
-		set->n = n;
-		/* insertion sort; n is at most 64 */
-		for (i = 1; i < n; i++) {
-			u32 v = set->uid[i];
+	set = kzalloc(sizeof(*set), GFP_KERNEL);
+	if (!set)
+		return -ENOMEM;
 
-			for (j = i; j > 0 && set->uid[j - 1] > v; j--)
-				set->uid[j] = set->uid[j - 1];
-			set->uid[j] = v;
+	for (i = 0; i < n; i++) {
+		if (in[i].id == MH_EXEMPT_ANY) {
+			if (nu < MH_EXEMPT_MAX)
+				set->uid[nu++] = in[i].uid;
+		} else if (np < MH_POLICY_MAX) {
+			set->pair[np].uid = in[i].uid;
+			set->pair[np].id = in[i].id;
+			np++;
 		}
 	}
 
+	/* insertion sort; both arrays are small and written once per policy */
+	for (i = 1; i < nu; i++) {
+		u32 v = set->uid[i];
+
+		for (j = i; j > 0 && set->uid[j - 1] > v; j--)
+			set->uid[j] = set->uid[j - 1];
+		set->uid[j] = v;
+	}
+	for (i = 1; i < np; i++) {
+		struct mh_uidpair v = set->pair[i];
+
+		for (j = i; j > 0; j--) {
+			struct mh_uidpair *p = &set->pair[j - 1];
+
+			if (p->uid < v.uid ||
+			    (p->uid == v.uid && p->id <= v.id))
+				break;
+			set->pair[j] = *p;
+		}
+		set->pair[j] = v;
+	}
+
+	set->n = nu;
+	set->np = np;
 	old = rcu_dereference_protected(g_exempt, lockdep_is_held(&g_mutex));
 	rcu_assign_pointer(g_exempt, set);
 	if (old)
@@ -1228,7 +1293,7 @@ static bool mh_line_hidden(enum mh_kind kind, const char *buf, size_t len)
 
 		rcu_read_lock();
 		a = mh_name_match(l.point, strlen(l.point));
-		hide = a && mh_record_hides(a, &l);
+		hide = a && mh_record_hides(a, &l) && !mh_anchor_exempt(a->id);
 		rcu_read_unlock();
 		if (hide)
 			return true;
@@ -1407,6 +1472,12 @@ static int mh_hot_entry(struct kretprobe_instance *ri, struct pt_regs *regs,
 		u32 flags = a->flags & need;
 
 		mh_hit_record(a->id);
+
+		/* This caller asked to keep the native view of this one mount. */
+		if (mh_anchor_exempt(a->id)) {
+			rcu_read_unlock();
+			return 1;
+		}
 
 		/*
 		 * st_dev describes a filesystem and is valid for every path in
@@ -1697,14 +1768,15 @@ static int mh_process_payload(unsigned long user_addr)
 		ret = mh_records_refresh();
 		break;
 	case MH_CMD_POLICY:
-		if (pl->hdr.count > MH_EXEMPT_MAX ||
-		    pl->hdr.data_size < pl->hdr.count * (u32)sizeof(u32) ||
+		if (pl->hdr.count > MH_POLICY_MAX ||
+		    pl->hdr.data_size < pl->hdr.count * (u32)sizeof(struct mh_upolicy) ||
 		    pl->hdr.data_size > MH_BUF_MAX) {
 			ret = -EINVAL;
 			break;
 		}
 		mutex_lock(&g_mutex);
-		ret = mh_set_exempt((const u32 *)pl->buf, pl->hdr.count);
+		ret = mh_set_policy((const struct mh_upolicy *)pl->buf,
+				    pl->hdr.count);
 		mutex_unlock(&g_mutex);
 		break;
 	case MH_CMD_CONFIG:

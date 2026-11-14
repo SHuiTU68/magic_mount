@@ -799,9 +799,40 @@ mod tests {
 
 // ---------------------------------------------------------------- commands
 
+/// Other kernel modules that rewrite the same views.  Running two at once
+/// double-hides, and every diagnosis (a missing font, a leaked mount) becomes
+/// ambiguous.  This is reported, never enforced: refusing to load could leave a
+/// device without any mount core at all.
+const CONFLICTING: &[&str] = &[
+    "pathmask",
+    "procguard",
+    "nomount",
+    "susfs_guard_lkm",
+    "hybridmount",
+    "kasumi",
+];
+
+fn conflicts() -> Vec<String> {
+    let Ok(text) = fs::read_to_string("/proc/modules") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| *name != "magic_hide" && CONFLICTING.contains(name))
+        .map(str::to_string)
+        .collect()
+}
+
+fn report_conflicts() {
+    for name in conflicts() {
+        println!("magic_hide: conflict: {name} also rewrites mount/stat views");
+    }
+}
+
 fn load() {
     if loaded() {
         println!("magic_hide: already loaded");
+        report_conflicts();
         return;
     }
     if !cfg!(target_arch = "aarch64") {
@@ -833,6 +864,7 @@ fn load() {
         match insert(&path) {
             Ok(()) if loaded() => {
                 println!("magic_hide: loaded {}", path.file_name().unwrap_or_default().to_string_lossy());
+                report_conflicts();
                 return;
             }
             Ok(()) => eprintln!(
@@ -968,6 +1000,11 @@ fn status() {
     println!("platform: {}", property("ro.build.version.release"));
     println!("arch:     {}", std::env::consts::ARCH);
     println!("state:    {}", if loaded() { "loaded" } else { "not loaded" });
+    let conflicts = conflicts();
+    println!(
+        "conflict: {}",
+        if conflicts.is_empty() { "none".to_string() } else { conflicts.join(", ") }
+    );
     println!("dir:      {}", module_dir().display());
     println!("failures: {}", read_count(&failures_file()));
 
