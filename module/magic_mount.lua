@@ -160,11 +160,15 @@ local function report()
 end
 
 function M.version()
-    return 9
+    return 10
 end
 
 function M.post_fs_data(superkey)
     log("post_fs_data called")
+    -- The report has to survive module updates and both load attempts below
+    -- append to it, but one copy per boot must not pile up: the file is
+    -- truncated by the first stage of the boot, then appended in place.
+    run((": > '%s'"):format(moddir() .. "/lkm.log"))
     loader("load", moddir() .. "/lkm.log")
 end
 
