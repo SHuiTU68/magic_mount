@@ -30,7 +30,7 @@ typedef int32_t  mh_s32;
 
 #define MH_PAGE_SIZE        4096u
 #define MH_PAYLOAD_MAGIC    0x4d485359u /* "MHSY" */
-#define MH_PAYLOAD_VERSION  7u /* 7: POLICY carries (uid, record) pairs */
+#define MH_PAYLOAD_VERSION  8u /* 8: ADD carries a SID index per record */
 #define MH_PATH_MAX         512
 
 /* Key type used by the LKM; add_key() is cancelled right after it runs. */
@@ -47,6 +47,7 @@ enum mh_cmd {
 	MH_CMD_EVENTS = 6, /* dump observed syscall callers, then clear      */
 	MH_CMD_CONFIG = 7, /* deliver the four ftrace addresses (u64[])      */
 	MH_CMD_HITS = 8,   /* dump who touched covered mounts, then clear    */
+	MH_CMD_SID = 9,    /* replace the security.selinux string pool       */
 };
 
 enum mh_mode {
@@ -140,6 +141,16 @@ struct mh_upolicy {
 };
 
 /*
+ * security.selinux spoofing.  Userspace samples the native context of every
+ * covered path before it is mounted over and sends the distinct strings once
+ * (`MH_CMD_SID`: count NUL-terminated strings in buf); each record then names
+ * its context by index, which keeps the ADD payload small.
+ */
+#define MH_SID_MAX 8
+#define MH_SID_LEN 72
+#define MH_SID_NONE 0xffffffffu
+
+/*
  * One published mountpoint.  path_off/path_len point into mh_upayload.buf and
  * are relative to the start of that buffer.  dev is already in the kernel
  * dev_t encoding, i.e. (major << 20) | minor.  m_flags is the value
@@ -155,6 +166,7 @@ struct mh_urec {
 	mh_u32 m_flags;
 	struct mh_ustatfs st; /* valid when MH_REC_F_STAT is set */
 	struct mh_ukstat ks;  /* valid when MH_REC_F_INO / _DSIZE is set */
+	mh_u32 sid;           /* index into the MH_CMD_SID pool, or MH_SID_NONE */
 };
 
 struct mh_uhdr {

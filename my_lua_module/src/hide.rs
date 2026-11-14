@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MH_PAGE_SIZE: usize = 4096;
 const MH_PAYLOAD_MAGIC: u32 = 0x4d48_5359; // "MHSY"
-const MH_PAYLOAD_VERSION: u32 = 7; // 7: POLICY carries (uid, record) pairs
+const MH_PAYLOAD_VERSION: u32 = 8; // 8: ADD carries a SID index per record
 const MH_PATH_MAX: usize = 512;
 const MH_BUF_MAX: usize = MH_PAGE_SIZE - std::mem::size_of::<Uhdr>();
 
@@ -43,6 +43,13 @@ const MH_CMD_POLICY: u32 = 5;
 const MH_CMD_EVENTS: u32 = 6;
 const MH_CMD_CONFIG: u32 = 7;
 const MH_CMD_HITS: u32 = 8;
+const MH_CMD_SID: u32 = 9;
+
+/// Distinct SELinux contexts one publish may hand over (`MH_SID_MAX`).
+const MH_SID_MAX: usize = 8;
+/// Kernel side buffer for one context (`MH_SID_LEN`), NUL not included.
+const MH_SID_LEN: usize = 72;
+const MH_SID_NONE: u32 = u32::MAX;
 
 /// Whole-uid exemption, as opposed to one record id.
 const MH_EXEMPT_ANY: u32 = u32::MAX;
@@ -97,6 +104,8 @@ struct Urec {
     m_flags: u32,
     st: Ustatfs,
     ks: Ukstat,
+    /// Index into the SID pool sent with `MH_CMD_SID`, or `MH_SID_NONE`.
+    sid: u32,
 }
 
 /// Wire layout of `struct mh_ukstat`: the inode-level fields of the covered
@@ -164,6 +173,8 @@ struct MountEntry {
 /// Everything magic_mount touched, published to the LKM in one go.
 pub struct MountTable {
     records: Mutex<HashMap<PathBuf, Native>>,
+    /// `security.selinux` the covered path had before the mount existed.
+    sids: Mutex<HashMap<PathBuf, String>>,
     mounts: Option<Vec<MountEntry>>,
     /// Top-level component -> its real directory.  ROMs symlink partitions
     /// (`/product -> /my_product`), while mountinfo only knows the resolved
@@ -176,6 +187,7 @@ impl MountTable {
     pub fn new() -> Self {
         Self {
             records: Mutex::new(HashMap::new()),
+            sids: Mutex::new(HashMap::new()),
             mounts: Some(snapshot_mounts()),
             roots: Mutex::new(HashMap::new()),
         }
@@ -235,6 +247,15 @@ impl MountTable {
                 native.ks.ino = synth_ino(path);
                 native.flags |= MH_REC_F_INO;
             }
+        }
+
+        // Read the context now, while the path is still the native one: after
+        // the mount it reports the workspace filesystem's label.
+        if let Some(sid) = selinux_context(path) {
+            self.sids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_path_buf(), sid);
         }
 
         self.lock().insert(path.to_path_buf(), native);
@@ -313,6 +334,25 @@ impl MountTable {
             return;
         }
 
+        // Hand over the distinct native SELinux contexts before the records
+        // that index them.  Nothing else distinguishes a workspace tmpfs inode
+        // from a partition one, so this is sent first and in publish order.
+        let (pool, rec_sid) = self.sid_pool(&entries);
+        if !pool.is_empty() {
+            let mut at = 0usize;
+            {
+                let buf = payload.buf_mut();
+                for sid in &pool {
+                    buf[at..at + sid.len()].copy_from_slice(sid.as_bytes());
+                    buf[at + sid.len()] = 0;
+                    at += sid.len() + 1;
+                }
+            }
+            if !payload.send(MH_CMD_SID, pool.len() as u32, at as u32) {
+                return;
+            }
+        }
+
         let mut i = 0;
         let mut published: Vec<PathBuf> = Vec::with_capacity(entries.len());
         while i < entries.len() {
@@ -352,6 +392,7 @@ impl MountTable {
                         m_flags: native.m_flags,
                         st: native.st,
                         ks: native.ks,
+                        sid: rec_sid[i + k],
                     };
                     let at = k * std::mem::size_of::<Urec>();
                     buf[at..at + std::mem::size_of::<Urec>()].copy_from_slice(&to_bytes(&rec));
@@ -381,6 +422,36 @@ impl MountTable {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Native>> {
         self.records.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Distinct contexts for one publish, in first-use order.  A value that
+    /// does not fit the pool degrades to "no spoof" instead of failing the
+    /// whole table, so an odd label can never hide the mounts.
+    fn sid_pool(&self, entries: &[(PathBuf, Native)]) -> (Vec<String>, Vec<u32>) {
+        let sids = self.sids.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut pool: Vec<String> = Vec::new();
+        let mut index: HashMap<String, u32> = HashMap::new();
+        let mut rec = Vec::with_capacity(entries.len());
+
+        for (path, _) in entries {
+            let Some(sid) = sids.get(path) else {
+                rec.push(MH_SID_NONE);
+                continue;
+            };
+            if sid.is_empty() || sid.len() >= MH_SID_LEN {
+                rec.push(MH_SID_NONE);
+            } else if let Some(i) = index.get(sid) {
+                rec.push(*i);
+            } else if pool.len() < MH_SID_MAX {
+                let i = pool.len() as u32;
+                pool.push(sid.clone());
+                index.insert(sid.clone(), i);
+                rec.push(i);
+            } else {
+                rec.push(MH_SID_NONE);
+            }
+        }
+        (pool, rec)
     }
 }
 
@@ -1066,6 +1137,52 @@ fn stock_stat(path: &Path) -> Option<StockStat> {
         nlink: meta.nlink(),
         is_dir: meta.file_type().is_dir(),
     })
+}
+
+/// Native `security.selinux` context of `path` or, for a file the module adds
+/// (no stock counterpart), of its nearest labelled ancestor - the label the
+/// new entry would inherit on that partition.
+fn selinux_context(path: &Path) -> Option<String> {
+    let mut probe = path;
+
+    for _ in 0..4 {
+        if let Some(sid) = raw_selinux(probe) {
+            return Some(sid);
+        }
+        probe = probe.parent()?;
+        if probe.as_os_str() == "/" {
+            break;
+        }
+    }
+    None
+}
+
+/// One `getxattr("security.selinux")` on `path`.
+fn raw_selinux(path: &Path) -> Option<String> {
+    const NAME: &[u8] = b"security.selinux\0";
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+
+    // SAFETY: the path is a valid C string; a null buffer asks only for the
+    // length, which getxattr() documents.
+    unsafe {
+        let name = NAME.as_ptr() as *const libc::c_char;
+        let need = libc::getxattr(c.as_ptr(), name, std::ptr::null_mut(), 0);
+        if need <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; need as usize];
+        let got = libc::getxattr(
+            c.as_ptr(),
+            name,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        );
+        if got <= 0 {
+            return None;
+        }
+        buf.truncate(got as usize);
+        String::from_utf8(buf).ok()
+    }
 }
 
 /// Plausible inode for a path that has no stock counterpart.  ext4/EROFS keep

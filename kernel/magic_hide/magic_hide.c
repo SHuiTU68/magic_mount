@@ -14,7 +14,9 @@
  *   4. the module and its probes are listed in /proc/modules and
  *      /sys/kernel/debug/kprobes/list;
  *   5. every caller gets the same answer, including a process that still has
- *      to use the real partition.
+ *      to use the real partition;
+ *   6. getxattr("security.selinux") reports the workspace filesystem's label
+ *      instead of the one the covered path had.
  *
  * Point 5 is handled outside the kretprobes: an ftrace op on the stat syscall
  * wrappers only records *who* asked (uid/pid/comm, gated by one atomic read
@@ -48,6 +50,14 @@
  *
  * Point 4's /proc/modules half is the m_show hook; the debugfs kprobes list
  * half is show_kprobe_addr.  Both are hidden from the same uids as points 1-3.
+ *
+ * Point 6 is a kretprobe on vfs_getxattr(): userspace samples the context of
+ * every target before the mount exists and ships the distinct strings with the
+ * table, so the answer is just a string copy from the anchor.  That fixes what
+ * getfilecon()/ls -Z/stat -c %C report and makes the mount indistinguishable
+ * from a stock one to anything that reads the label.  SELinux's own permission
+ * checks consume the inode's in-kernel SID, which is neither readable nor
+ * writable without the LSM internals; a module cannot change that half.
  *
  * The proc hooks do not depend only on the paths userspace records.  A line is
  * hidden when any of these signatures matches, so the mount table stays clean
@@ -89,6 +99,8 @@
  * 5.10 / 5.15 / 6.1 / 6.6 / 6.12 are handled: the kretprobe fields used here,
  * the vfs_getattr()/vfs_statfs() signatures and the list show functions are
  * identical on those trees (6.6 also keeps entry_handler/rethook semantics).
+ * vfs_getxattr() is the one exception - it gained an idmap argument in 5.12 -
+ * so its arguments are read through MH_XATTR_* below.
  */
 
 #define pr_fmt(fmt) "magic_hide: " fmt
@@ -175,6 +187,7 @@ struct mh_anchor {
 	unsigned int name_len;
 	u32 flags;
 	u32 id;                /* publish order, used by the hit table */
+	u32 sid;               /* index into the SID pool, or MH_SID_NONE */
 	u64 dev;
 	u64 f_type;
 	u32 m_flags;           /* statfs().f_flags of the covered mount */
@@ -199,6 +212,13 @@ struct mh_hot_inst {
 	struct mh_ukstat ks;
 };
 
+/* vfs_getxattr("security.selinux"): the caller's buffer, resolved at return. */
+struct mh_xattr_inst {
+	void *value;
+	size_t size;
+	struct dentry *dentry;
+};
+
 static LIST_HEAD(g_anchors);
 static DEFINE_MUTEX(g_mutex);
 /*
@@ -221,14 +241,57 @@ static atomic_t g_hot_mflags = ATOMIC_INIT(0);
 static atomic_t g_hot_stat = ATOMIC_INIT(0);
 static atomic_t g_anchor_count = ATOMIC_INIT(0);
 
+/*
+ * Superblocks the anchors live on.  A getxattr("security.selinux") on any
+ * other filesystem bails out before walking the parent chain, which keeps the
+ * xattr hook free outside our own workspace.
+ */
+#define MH_SB_MAX 8
+static struct super_block *g_sbs[MH_SB_MAX];
+static int g_nsb;
+
+/* Native SELinux contexts sampled by userspace before the mounts existed. */
+static char *g_sid[MH_SID_MAX];
+static u32 g_nsid;
+
 #if defined(CONFIG_X86_64)
 #define MH_PARM1(regs) ((regs)->di)
 #define MH_PARM2(regs) ((regs)->si)
+#define MH_PARM3(regs) ((regs)->dx)
+#define MH_PARM4(regs) ((regs)->cx)
+#define MH_PARM5(regs) ((regs)->r8)
+#define MH_SET_RET(regs, val) ((regs)->ax = (unsigned long)(val))
 #elif defined(CONFIG_ARM64)
 #define MH_PARM1(regs) ((regs)->regs[0])
 #define MH_PARM2(regs) ((regs)->regs[1])
+#define MH_PARM3(regs) ((regs)->regs[2])
+#define MH_PARM4(regs) ((regs)->regs[3])
+#define MH_PARM5(regs) ((regs)->regs[4])
+#define MH_SET_RET(regs, val) ((regs)->regs[0] = (unsigned long)(val))
 #else
 #error "magic_hide: unsupported architecture"
+#endif
+
+/*
+ * vfs_getxattr() grew an idmap argument with idmapped mounts (5.12):
+ *
+ *   5.10      vfs_getxattr(dentry, name, value, size)
+ *   5.15+     vfs_getxattr(idmap, dentry, name, value, size), idmap is a
+ *             struct user_namespace * before 6.6 and struct mnt_idmap * after
+ *
+ * The 5.10 KMIs are built from their own headers, so the version check is
+ * enough; it also keeps the unused extra register from being read on 5.10.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#define MH_XATTR_DENTRY(regs) ((struct dentry *)MH_PARM2(regs))
+#define MH_XATTR_NAME(regs) ((const char *)MH_PARM3(regs))
+#define MH_XATTR_VALUE(regs) ((void *)MH_PARM4(regs))
+#define MH_XATTR_SIZE(regs) ((size_t)MH_PARM5(regs))
+#else
+#define MH_XATTR_DENTRY(regs) ((struct dentry *)MH_PARM1(regs))
+#define MH_XATTR_NAME(regs) ((const char *)MH_PARM2(regs))
+#define MH_XATTR_VALUE(regs) ((void *)MH_PARM3(regs))
+#define MH_XATTR_SIZE(regs) ((size_t)MH_PARM4(regs))
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -749,15 +812,13 @@ static unsigned int mh_slot(const struct dentry *d, unsigned int probe)
 }
 
 /* Must be called with rcu_read_lock() held. */
-static struct mh_anchor *mh_hot_lookup(const struct vfsmount *mnt)
+static struct mh_anchor *mh_hot_lookup_dentry(const struct dentry *key)
 {
-	const struct dentry *key;
 	unsigned int i;
 
-	if (!atomic_read(&g_hot_count))
+	if (!key || !atomic_read(&g_hot_count))
 		return NULL;
 
-	key = READ_ONCE(mnt->mnt_root);
 	for (i = 0; i < MH_HOT_PROBES; i++) {
 		struct mh_anchor *a = rcu_dereference(g_hot[mh_slot(key, i)]);
 
@@ -767,6 +828,12 @@ static struct mh_anchor *mh_hot_lookup(const struct vfsmount *mnt)
 			return a;
 	}
 	return NULL;
+}
+
+/* Must be called with rcu_read_lock() held. */
+static struct mh_anchor *mh_hot_lookup(const struct vfsmount *mnt)
+{
+	return mh_hot_lookup_dentry(READ_ONCE(mnt->mnt_root));
 }
 
 /* Called with g_mutex held. */
@@ -795,6 +862,77 @@ static int mh_hot_insert(struct mh_anchor *a)
 }
 
 static void mh_hot_register(void);
+
+/* Called with g_mutex held. */
+static void mh_sb_remember(struct super_block *sb)
+{
+	int i;
+
+	if (!sb)
+		return;
+	for (i = 0; i < g_nsb; i++)
+		if (g_sbs[i] == sb)
+			return;
+	if (g_nsb < MH_SB_MAX)
+		WRITE_ONCE(g_sbs[g_nsb++], sb);
+}
+
+static bool mh_sb_known(const struct super_block *sb)
+{
+	int i;
+
+	if (!sb)
+		return false;
+	for (i = 0; i < READ_ONCE(g_nsb); i++)
+		if (READ_ONCE(g_sbs[i]) == sb)
+			return true;
+	return false;
+}
+
+static void mh_sid_clear(void)
+{
+	u32 i;
+
+	for (i = 0; i < g_nsid; i++) {
+		kfree(g_sid[i]);
+		g_sid[i] = NULL;
+	}
+	WRITE_ONCE(g_nsid, 0);
+}
+
+/*
+ * `n` NUL-terminated contexts packed into buf.  Called from ->preparse() with
+ * g_mutex held; the xattr probe is not registered yet at that point, so no
+ * reader can race the free.
+ */
+static int mh_sid_set(const char *buf, u32 n, u32 size)
+{
+	u32 i, off = 0;
+
+	if (n > MH_SID_MAX)
+		return -EINVAL;
+	mh_sid_clear();
+	for (i = 0; i < n; i++) {
+		size_t left = (size > off) ? size - off : 0;
+		const char *s = buf + off;
+		size_t len;
+
+		if (!left)
+			goto bad;
+		len = strnlen(s, left);
+		if (len >= left || len >= MH_SID_LEN)
+			goto bad;
+		g_sid[i] = kstrndup(s, len, GFP_KERNEL);
+		if (!g_sid[i])
+			goto bad;
+		WRITE_ONCE(g_nsid, i + 1);
+		off += len + 1;
+	}
+	return 0;
+bad:
+	mh_sid_clear();
+	return -EINVAL;
+}
 
 /* Called with g_mutex held. */
 static void mh_hot_clear(void)
@@ -894,6 +1032,8 @@ static void mh_records_reset(void)
 		list_add_tail(&a->dead, &dead_list);
 	}
 	mh_hot_clear();
+	g_nsb = 0;
+	mh_sid_clear();
 	atomic_set(&g_anchor_count, 0);
 	mutex_unlock(&g_mutex);
 
@@ -963,7 +1103,7 @@ static int mh_records_refresh(void)
 static int mh_records_add(const char *name, unsigned int len, u32 flags,
 			  u64 dev, u64 f_type, u32 m_flags,
 			  const struct mh_ustatfs *st,
-			  const struct mh_ukstat *ks)
+			  const struct mh_ukstat *ks, u32 sid)
 {
 	struct mh_anchor *a;
 
@@ -990,10 +1130,12 @@ static int mh_records_add(const char *name, unsigned int len, u32 flags,
 		a->st = *st;
 	if (ks)
 		a->ks = *ks;
+	a->sid = sid < READ_ONCE(g_nsid) ? sid : MH_SID_NONE;
 	if (kern_path(a->name, LOOKUP_FOLLOW, &a->path) == 0)
 		a->have_path = true;
 
 	mutex_lock(&g_mutex);
+	mh_sb_remember(a->have_path ? a->path.dentry->d_sb : NULL);
 	if (!a->have_path || !a->flags || mh_hot_insert(a) < 0)
 		a->flags = 0; /* procfs hiding only */
 	a->id = (u32)atomic_read(&g_anchor_count);
@@ -1436,6 +1578,90 @@ static int mh_seq_ret(struct kretprobe_instance *ri, struct pt_regs *regs,
 }
 
 /* ------------------------------------------------------------------ */
+/* kretprobe handlers: security.selinux spoofing                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A file magic_mount serves from its workspace carries the label of that
+ * filesystem (tmpfs), not the label the covered path had.  That is both a
+ * fingerprint (`ls -Z`, `stat -c %C`, getfilecon) and a possible policy
+ * mismatch, so report the context userspace sampled before the mount existed.
+ *
+ * The anchor is found by walking up from the dentry: a bind mount does not
+ * start a new dentry tree, so the mount root is a plain ancestor.  Only paths
+ * on a registered superblock take that walk.
+ */
+static struct mh_anchor *mh_dentry_anchor(struct dentry *d)
+{
+	int depth = 32;
+
+	while (d && depth--) {
+		struct mh_anchor *a = mh_hot_lookup_dentry(d);
+
+		if (a)
+			return a;
+		if (d == d->d_parent)
+			break;
+		d = READ_ONCE(d->d_parent);
+	}
+	return NULL;
+}
+
+static int mh_xattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct mh_xattr_inst *d = (struct mh_xattr_inst *)ri->data;
+	struct dentry *dentry = MH_XATTR_DENTRY(regs);
+	const char *name = MH_XATTR_NAME(regs);
+
+	if (!READ_ONCE(g_nsid) || !dentry || !name)
+		return 1;
+	if (strcmp(name, "security.selinux"))
+		return 1;
+	if (!mh_sb_known(dentry->d_sb))
+		return 1;
+
+	d->value = MH_XATTR_VALUE(regs);
+	d->size = MH_XATTR_SIZE(regs);
+	d->dentry = dentry;
+	return 0;
+}
+
+static int mh_xattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct mh_xattr_inst *d = (struct mh_xattr_inst *)ri->data;
+	struct mh_anchor *a;
+	const char *sid;
+	size_t len;
+
+	if (regs_return_value(regs) < 0)
+		return 0;
+
+	rcu_read_lock();
+	a = mh_dentry_anchor(d->dentry);
+	if (!a || a->sid >= READ_ONCE(g_nsid)) {
+		rcu_read_unlock();
+		return 0;
+	}
+	sid = READ_ONCE(g_sid[a->sid]);
+	len = sid ? strlen(sid) : 0;
+	if (!len) {
+		rcu_read_unlock();
+		return 0;
+	}
+	/* size == 0 asks only for the length every getxattr() caller starts with */
+	if (!d->value || !d->size) {
+		MH_SET_RET(regs, len);
+	} else if (len <= d->size) {
+		memcpy(d->value, sid, len);
+		MH_SET_RET(regs, len);
+	} else {
+		MH_SET_RET(regs, -ERANGE);
+	}
+	rcu_read_unlock();
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* kretprobe handlers: hot vfs_statfs / vfs_getattr                    */
 /* ------------------------------------------------------------------ */
 
@@ -1625,6 +1851,14 @@ static struct kretprobe g_rp_statfs =
 static struct kretprobe g_rp_getattr =
 	MH_HOT_RP("vfs_getattr", mh_getattr, 128);
 
+static struct kretprobe g_rp_xattr = {
+	.kp = { .symbol_name = "vfs_getxattr" },
+	.entry_handler = mh_xattr_entry,
+	.handler = mh_xattr_ret,
+	.data_size = sizeof(struct mh_xattr_inst),
+	.maxactive = 128,
+};
+
 static bool g_reg_mountinfo;
 static bool g_reg_vfsmnt;
 static bool g_reg_vfsstat;
@@ -1632,9 +1866,14 @@ static bool g_reg_modules;
 static bool g_reg_kprobes;
 static bool g_reg_statfs;
 static bool g_reg_getattr;
+static bool g_reg_xattr;
 
 static void mh_hot_unregister(void)
 {
+	if (g_reg_xattr) {
+		unregister_kretprobe(&g_rp_xattr);
+		g_reg_xattr = false;
+	}
 	if (g_reg_statfs) {
 		unregister_kretprobe(&g_rp_statfs);
 		g_reg_statfs = false;
@@ -1667,6 +1906,13 @@ static void mh_hot_register(void)
 			pr_debug("cannot probe vfs_getattr: %d\n", ret);
 		else
 			g_reg_getattr = true;
+	}
+	if (!g_reg_xattr && READ_ONCE(g_nsid) && atomic_read(&g_hot_count)) {
+		ret = register_kretprobe(&g_rp_xattr);
+		if (ret)
+			pr_debug("cannot probe vfs_getxattr: %d\n", ret);
+		else
+			g_reg_xattr = true;
 	}
 }
 
@@ -1713,7 +1959,8 @@ static int mh_payload_add(struct mh_upayload *pl)
 				   (rec->flags & MH_REC_F_STAT) ? &rec->st :
 								  NULL,
 				   (rec->flags & (MH_REC_F_INO | MH_REC_F_DSIZE)) ?
-					   &rec->ks : NULL) < 0 && !ret)
+					   &rec->ks : NULL,
+				   rec->sid) < 0 && !ret)
 			ret = -ENOMEM;
 	}
 	mh_hot_register();
@@ -1794,6 +2041,18 @@ static int mh_process_payload(unsigned long user_addr)
 	case MH_CMD_HITS:
 		pl->hdr.count = mh_hits_dump(pl, pl->hdr.mode != 0);
 		pl->hdr.data_size = pl->hdr.count * (u32)sizeof(struct mh_uhit);
+		break;
+	case MH_CMD_SID:
+		if (pl->hdr.count > MH_SID_MAX || pl->hdr.data_size > MH_BUF_MAX) {
+			ret = -EINVAL;
+			break;
+		}
+		/* The return handler reads the pool locklessly: stop it first. */
+		mh_hot_unregister();
+		mutex_lock(&g_mutex);
+		ret = mh_sid_set(pl->buf, pl->hdr.count, pl->hdr.data_size);
+		mutex_unlock(&g_mutex);
+		mh_hot_register();
 		break;
 	default:
 		ret = -EINVAL;
